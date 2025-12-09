@@ -1,6 +1,3 @@
-#Automaticaly recalculate=true
-#Single model=false
-#Run for one model=false
 # Скрипт для анализа качества настройки пластового давления по скважинам
 # В качестве входных данных - текстовый файл с фактическими давлениями по формату "Скважина	Дата(ДД.ММ.ГГГГ)	Давления(в барах)"
 
@@ -10,6 +7,10 @@ import pandas as pd
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.formatting.rule import ColorScaleRule
+
 
 # БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
 WBP_FACT_TXT: str = "scripts_data/Pfkt0.inc"  # Относительный путь до файла с фактическими давлениями
@@ -643,6 +644,222 @@ def save_to_excel_structured(well_dataframes, historical_df, models_interpolated
     
     return output_path
 
+
+def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models_interpolated, 
+                                        output_path="structured_comparison_single_sheet.xlsx"):
+    """
+    Сохранить данные в Excel файл на один лист с указанной структурой в виде единой таблицы:
+    1 строка: well, date, wbp_hist, model_name1, "", "", model_name2, "", "", ...
+    2 строка: "", "", "", wbp_model, wgpr_model, wgir_model, wbp_model, wgpr_model, wgir_model...
+    А ниже данные по всем скважинам в единой таблице.
+    
+    Parameters:
+    -----------
+    well_dataframes : dict
+        DataFrame по скважинам
+    historical_df : pd.DataFrame
+        Исторические данные
+    models_interpolated : dict
+        Интерполированные данные моделей
+    output_path : str
+        Путь для сохранения Excel файла
+    """
+    print(f"\nСохранение данных в Excel файл (единая таблица): {output_path}")
+    
+    # Создаем новый Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Все скважины"
+    
+    # Получаем список всех моделей (уникальные по всем скважинам)
+    all_models = set()
+    for df_well in well_dataframes.values():
+        all_models.update([m for m in df_well['model'].unique() if m != 'HISTORICAL'])
+    all_models = sorted(all_models)
+    
+    if not all_models:
+        print("    Предупреждение: нет модельных данных")
+        ws.append(["Нет модельных данных"])
+        wb.save(output_path)
+        return output_path
+    
+    print(f"  Найдено моделей: {all_models}")
+    print(f"  Всего скважин: {len(well_dataframes)}")
+    
+    # === СТРОКА 1: Заголовки таблицы ===
+    header_row1 = ['well', 'date', 'wbp_hist']
+    for model in all_models:
+        header_row1.append(model)  # Название модели
+        header_row1.append("")      # Пустой столбец
+        header_row1.append("")      # Пустой столбец
+    
+    ws.append(header_row1)
+    
+    # === СТРОКА 2: Подзаголовки параметров ===
+    header_row2 = ['', '', '']
+    for model in all_models:
+        header_row2.append('wbp_model')
+        header_row2.append('wgpr_model')
+        header_row2.append('wgir_model')
+    
+    ws.append(header_row2)
+    
+    # === СБОР ВСЕХ ДАННЫХ В ОДНУ ТАБЛИЦУ ===
+    total_rows = 0
+    
+    for well_idx, (well_name, df_well) in enumerate(well_dataframes.items()):
+        print(f"  Обработка скважины {well_name} ({well_idx+1}/{len(well_dataframes)})...")
+        
+        # Получаем уникальные даты для этой скважины (уже отсортированы)
+        well_dates = sorted(df_well['date'].unique())
+        
+        if not well_dates:
+            print(f"    Предупреждение: для скважины {well_name} нет данных по датам")
+            continue
+        
+        # Для каждой даты создаем строку данных
+        for date in well_dates:
+            # Преобразуем дату в строку (обрабатываем разные форматы дат)
+            try:
+                if isinstance(date, (pd.Timestamp, datetime)):
+                    date_str = date.strftime('%d.%m.%Y')
+                elif isinstance(date, np.datetime64):
+                    # Преобразуем numpy.datetime64 в pandas.Timestamp
+                    date_str = pd.Timestamp(date).strftime('%d.%m.%Y')
+                else:
+                    date_str = str(date)
+            except Exception as e:
+                print(f"    Ошибка преобразования даты {date}: {e}")
+                date_str = str(date)
+            
+            # Получаем историческое давление для этой даты
+            hist_pressure = None
+            hist_row = df_well[(df_well['date'] == date) & 
+                              (df_well['model'] == 'HISTORICAL') & 
+                              (df_well['parameter'] == 'pressure')]
+            if not hist_row.empty:
+                hist_pressure = hist_row['value'].iloc[0]
+            
+            # Создаем строку данных
+            data_row = [well_name, date_str, hist_pressure]
+            
+            # Добавляем модельные данные для каждой модели из общего списка
+            for model in all_models:
+                # Проверяем, есть ли данные для этой модели у текущей скважины
+                if model in df_well['model'].unique():
+                    # Давление (wbp)
+                    wbp_value = None
+                    wbp_row = df_well[(df_well['date'] == date) & 
+                                     (df_well['model'] == model) & 
+                                     (df_well['parameter'] == 'pressure')]
+                    if not wbp_row.empty:
+                        wbp_value = wbp_row['value'].iloc[0]
+                    
+                    # Добыча газа (wgpr)
+                    wgpr_value = None
+                    wgpr_row = df_well[(df_well['date'] == date) & 
+                                      (df_well['model'] == model) & 
+                                      (df_well['parameter'] == 'gas_rate')]
+                    if not wgpr_row.empty:
+                        wgpr_value = wgpr_row['value'].iloc[0]
+                    
+                    # Закачка газа (wgir)
+                    wgir_value = None
+                    wgir_row = df_well[(df_well['date'] == date) & 
+                                      (df_well['model'] == model) & 
+                                      (df_well['parameter'] == 'gas_injection')]
+                    if not wgir_row.empty:
+                        wgir_value = wgir_row['value'].iloc[0]
+                else:
+                    # Если модель отсутствует для этой скважины, заполняем None
+                    wbp_value = None
+                    wgpr_value = None
+                    wgir_value = None
+                
+                data_row.extend([wbp_value, wgpr_value, wgir_value])
+            
+            # Добавляем строку в таблицу
+            ws.append(data_row)
+            total_rows += 1
+        
+        print(f"    ✓ Добавлено {len(well_dates)} строк для скважины {well_name}")
+    
+    # Автонастройка ширины столбцов
+    print("  Настройка ширины столбцов...")
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = min(max_length + 2, 30)
+        ws.column_dimensions[column_letter].width = adjusted_width
+    
+    # Определяем последнюю колонку для фильтра
+    last_col = openpyxl.utils.get_column_letter(ws.max_column)
+    
+    # Добавляем фильтры и закрепляем заголовки
+    print("  Применение фильтров...")
+    ws.auto_filter.ref = f"A1:{last_col}2"  # Фильтр на первых двух строках заголовков
+    ws.freeze_panes = "A3"  # Закрепляем первые две строки заголовков
+    
+    # Добавляем информационную строку в начало
+    ws.insert_rows(1)
+    
+    info_cell = ws['A1']
+    info_cell.value = f"Сравнение моделей и фактических данных | Скважин: {len(well_dataframes)} | Строк данных: {total_rows} | Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    info_cell.font = Font(bold=True, color="FFFFFF")
+    info_cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    info_cell.alignment = Alignment(horizontal="center")
+    
+    # Объединяем ячейки информационной строки
+    ws.merge_cells(f'A1:{last_col}1')
+    
+    # Форматирование заголовков таблицы (строки 2 и 3)
+    # Строка 2: Основные заголовки
+    for cell in ws[2]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    
+    # Строка 3: Подзаголовки параметров
+    for cell in ws[3]:
+        if cell.column > 3:  # Начиная с 4-го столбца (после well, date, wbp_hist)
+            cell.font = Font(italic=True, bold=True)
+            cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    
+    # Сохраняем файл
+    try:
+        wb.save(output_path)
+        print(f"\n✓ Файл успешно сохранен: {output_path}")
+        print(f"  Структура таблицы:")
+        print(f"    - Лист: '{ws.title}'")
+        print(f"    - Скважин: {len(well_dataframes)}")
+        print(f"    - Моделей: {len(all_models)}")
+        print(f"    - Столбцов: {ws.max_column}")
+        print(f"    - Всего строк данных: {total_rows}")
+        print(f"    - Фильтры: строки 2-3")
+        print(f"    - Закреплено: строки 1-3")
+        
+        # Выводим структуру столбцов
+        print(f"\n  Структура столбцов:")
+        print(f"    1. well - имя скважины")
+        print(f"    2. date - дата")
+        print(f"    3. wbp_hist - историческое давление")
+        col_idx = 4
+        for i, model in enumerate(all_models):
+            print(f"    {col_idx}. {model}_wbp - давление модели {model}")
+            print(f"    {col_idx+1}. {model}_wgpr - добыча газа модели {model}")
+            print(f"    {col_idx+2}. {model}_wgir - закачка газа модели {model}")
+            col_idx += 3
+        
+    except Exception as e:
+        print(f"✗ Ошибка при сохранении файла: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return output_path
+
+
 def main():
     """
     Основная функция для получения унифицированных данных
@@ -714,8 +931,8 @@ def main():
         
         # 4. Сохраняем данные в Excel с указанной структурой
         print(f"\n3. Сохранение данных в Excel файл...")
-        output_excel = os.path.join(PROJECT_FOLDER_PATH, "structured_comparison.xlsx")
-        save_to_excel_structured(well_dataframes, df_fact, models_interpolated, output_excel)
+        output_excel = os.path.join(PROJECT_FOLDER_PATH, "structured_comparison_single_sheet.xlsx")
+        save_to_excel_structured_single_sheet(well_dataframes, df_fact, models_interpolated, output_excel)
         
         # Возвращаем данные для дальнейшего использования
         return {
