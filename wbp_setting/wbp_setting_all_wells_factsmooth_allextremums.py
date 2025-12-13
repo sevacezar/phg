@@ -1,0 +1,1836 @@
+# Скрипт для анализа качества настройки пластового давления по скважинам
+# В качестве входных данных - текстовый файл с фактическими давлениями по формату "Скважина	Дата(ДД.ММ.ГГГГ)	Давления(в барах)"
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy.signal import savgol_filter, find_peaks
+from scipy.interpolate import interp1d
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.formatting.rule import ColorScaleRule
+
+
+# БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
+WBP_FACT_TXT: str = "scripts_data/Pfkt0_test.inc"  # Относительный путь до файла с фактическими давлениями
+MODEL_NAMES: list[str] = [
+    "Hist_L0_adapt_GC_AQ_bz_YAMB_SWL_new_swl1.2",
+]
+
+# Глобальные настройки сглаживания
+SMOOTHING_WINDOW = 51  # Размер окна сглаживания (нечетное число)
+SMOOTHING_POLYORDER = 3  # Порядок полинома для фильтра Савицкого-Голея
+SMOOTHING_INTERP_METHOD = 'cubic'  # Метод интерполяции для сглаженной кривой
+MIN_POINTS_FOR_SMOOTHING = 5  # Минимальное количество точек для сглаживания
+
+# Настройки поиска экстремумов
+MIN_DISTANCE_DAYS = 60  # Минимальное расстояние между экстремумами в днях
+PROMINENCE_PERCENT = 2  # Минимальная значимость экстремума в процентах от среднего значения
+MAX_CYCLE_DAYS = 400   # Максимальная длина цикла в днях
+EDGE_BUFFER_DAYS = 30  # Буфер для обработки краев данных в днях
+# БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
+
+PROJECT_FOLDER_PATH: str = get_project_folder()
+
+
+def parse_fact_well_data(file_path: str) -> pd.DataFrame:
+    """
+    Парсит файл с данными скважин и возвращает DataFrame
+    """
+    print('Формирую датафрейм на основе фактических данных...')
+    encodings = ['utf-8', 'cp1251', 'cp1252', 'latin1', 'iso-8859-1', 'windows-1251']
+
+    # Читаем файл
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                lines = f.readlines()
+            print(f'Успешно прочитан файл "{file_path}" с кодировкой {encoding}')
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ValueError('Файл не читается в представленных кодировках')
+    
+    data = []
+    
+    for line in lines:
+        # Пропускаем строки с комментариями и служебной информацией
+        if line.startswith('--') or line.startswith('PC_') or 'C:\\' in line:
+            continue
+        
+        # Разделяем строку на элементы
+        parts = line.strip().split()
+        
+        # Проверяем, что строка содержит 3 значения (well_fact, date_fact, wpb_bar_fact)
+        if len(parts) == 3:
+            try:
+                well_fact = str(parts[0])
+                date_str = parts[1]
+                wpb_bar_fact = float(parts[2])
+                
+                # Преобразуем дату в формат datetime
+                try:
+                    date_fact = datetime.strptime(date_str, '%d.%m.%Y')
+                except ValueError as exc:
+                    print(f'ОШИБКА извлечения даты в строке "{line}"')
+                    print(f'ОШИБКА: {str(exc)}')
+                    continue
+                
+                data.append({
+                    'well_fact': well_fact,
+                    'date_fact': date_fact,
+                    'wpb_bar_fact': wpb_bar_fact
+                })
+            except (ValueError, IndexError) as exc:
+                print(f'ОШИБКА извлечения данных из строки "{line}"')
+                print(f'ОШИБКА: {str(exc)}')
+                continue
+    
+    # Создаем DataFrame
+    df = pd.DataFrame(data)
+    
+    # Сортируем по well_fact и date_fact для удобства
+    if not df.empty:
+        df = df.sort_values(['well_fact', 'date_fact']).reset_index(drop=True)
+    print('...Сформирован датафрейм на основе фактических данных')
+    return df
+
+
+def get_unique_fact_wells(df) -> list[str]:
+    """
+    Извлекает список уникальных имен скважин из DataFrame.
+    """
+    if df is None or df.empty:
+        print("DataFrame пустой или None")
+        return []
+    
+    if 'well_fact' not in df.columns:
+        print("В DataFrame отсутствует колонка 'well_fact'")
+        print(f"Доступные колонки: {list(df.columns)}")
+        return []
+    
+    # Извлекаем уникальные значения и сортируем их
+    unique_wells = sorted(df['well_fact'].unique().tolist())
+    
+    return unique_wells
+
+
+def get_raw_model_data(model_names: list[str], well_names: list[str], parameters: list[str] | None = None):
+    """
+    Получить сырые данные из моделей (без интерполяции)
+    """
+    if parameters is None:
+        parameters = ['wbp', 'wgpr', 'wgir']  # Давление, добыча газа, закачка газа
+    
+    models_data = {}
+    
+    for model_name in model_names:
+        print(f"Загрузка модели: {model_name}")
+        
+        try:
+            # Получаем объект модели
+            model = get_model_by_name(model_name)
+            
+            # Получаем все временные шаги
+            timesteps = get_all_timesteps()
+            model_dates = [t.to_datetime() for t in timesteps]
+            
+            # Создаем структуру для данных модели
+            model_data = {
+                'dates': model_dates,
+                'well_data': {}
+            }
+            
+            # Получаем список всех скважин в модели
+            try:
+                model_wells = get_all_wells()
+                model_well_names = [w.name for w in model_wells]
+                print(f"  В модели {len(model_well_names)} скважин")
+            except:
+                print(f"  Не удалось получить список скважин модели")
+                model_well_names = []
+            
+            # Для каждой запрошенной скважины
+            for well_name in well_names:
+                # Проверяем, есть ли скважина в модели
+                if well_name not in model_well_names:
+                    print(f"  Предупреждение: скважина {well_name} отсутствует в модели {model_name}")
+                    continue
+                
+                try:
+                    well = get_well_by_name(well_name)
+                    well_data = {}
+                    
+                    # Загружаем каждый параметр
+                    for param in parameters:
+                        try:
+                            # Пробуем разные варианты для давления
+                            if param == 'wbp':
+                                try:
+                                    graph_data = wbp[model, well]
+                                    print(f"    ✓ {well_name}.{param}: wbp найден")
+                                except Exception as e1:
+                                    try:
+                                        graph_data = wbhp[model, well]
+                                        print(f"    ✓ {well_name}.{param}: wbhp найден (вместо wbp)")
+                                    except Exception as e2:
+                                        try:
+                                            graph_data = wbhp_h[model, well]
+                                            print(f"    ✓ {well_name}.{param}: wbhp_h найден (вместо wbp)")
+                                        except Exception as e3:
+                                            print(f"    ✗ {well_name}.{param}: не удалось получить данные давления")
+                                            continue
+                            elif param == 'wgpr':
+                                try:
+                                    graph_data = wgpr[model, well]
+                                    print(f"    ✓ {well_name}.{param}: найден")
+                                except:
+                                    print(f"    ✗ {well_name}.{param}: не найден")
+                                    continue
+                            elif param == 'wgir':
+                                try:
+                                    graph_data = wgir[model, well]
+                                    print(f"    ✓ {well_name}.{param}: найден")
+                                except:
+                                    print(f"    ✗ {well_name}.{param}: не найден")
+                                    continue
+                            else:
+                                print(f"    ✗ {well_name}.{param}: неподдерживаемый параметр")
+                                continue
+                            
+                            # Извлекаем значения
+                            values = []
+                            for t in timesteps:
+                                try:
+                                    value = graph_data[t]
+                                    values.append(float(value))
+                                except:
+                                    values.append(np.nan)
+                            
+                            well_data[param] = values
+                            
+                        except Exception as e:
+                            print(f"    Ошибка при загрузке параметра {param} для {well_name}: {e}")
+                            continue
+                    
+                    model_data['well_data'][well_name] = well_data
+                    print(f"  ✓ Скважина {well_name}: успешно загружена")
+                    
+                except Exception as e:
+                    print(f"  Ошибка при обработке скважины {well_name}: {e}")
+                    continue
+            
+            models_data[model_name] = model_data
+            
+        except Exception as e:
+            print(f"Ошибка при загрузке модели {model_name}: {e}")
+            continue
+    
+    print(f"Итог: загружены данные из {len(models_data)} моделей")
+    
+    # Выводим сводную статистику по загруженным параметрам
+    for model_name, model_data in models_data.items():
+        well_count = len(model_data.get('well_data', {}))
+        print(f"  {model_name}: {well_count} скважин с данными")
+        
+        # Статистика по параметрам
+        if well_count > 0:
+            for well in list(model_data['well_data'].keys())[:3]:  # Первые 3 скважины для примера
+                params = model_data['well_data'][well].keys()
+                print(f"    {well}: параметры - {list(params)}")
+    
+    return models_data
+
+
+def create_combined_dataframe_per_well_without_interpolation(models_raw, historical_df,
+                                                           well_column='well_fact',
+                                                           date_column='date_fact',
+                                                           pressure_column='wpb_bar_fact'):
+    """
+    Создать объединенный DataFrame с данными, сгруппированными по скважинам
+    БЕЗ интерполяции - берем фактические даты и модельные даты как есть
+    """
+    # Преобразуем исторические даты
+    historical_df = historical_df.copy()
+    historical_df[date_column] = pd.to_datetime(historical_df[date_column])
+    
+    well_dataframes = {}
+    
+    # Сначала получаем список всех скважин
+    all_wells = set(historical_df[well_column].unique())
+    for model_data in models_raw.values():
+        all_wells.update(model_data.get('well_data', {}).keys())
+    
+    print(f"  Всего уникальных скважин: {len(all_wells)}")
+    
+    for well in all_wells:
+        all_records = []
+        
+        # Получаем фактические данные для этой скважины
+        well_historical = historical_df[historical_df[well_column] == well].copy()
+        
+        # Определяем минимальную и максимальную даты для фактических данных
+        if not well_historical.empty:
+            min_fact_date = well_historical[date_column].min()
+            max_fact_date = well_historical[date_column].max()
+            print(f"    Скважина {well}: фактические даты от {min_fact_date} до {max_fact_date}")
+        else:
+            min_fact_date = None
+            max_fact_date = None
+        
+        # 1. Добавляем фактические данные для этой скважины
+        for _, row in well_historical.iterrows():
+            if pd.notna(row.get(pressure_column)):
+                all_records.append({
+                    'date': row[date_column],
+                    'model': 'HISTORICAL',
+                    'parameter': 'pressure',
+                    'value': row[pressure_column]
+                })
+        
+        # 2. Добавляем модельные данные для этой скважины (без интерполяции)
+        for model_name, model_info in models_raw.items():
+            if well in model_info.get('well_data', {}):
+                model_dates = model_info['dates']
+                well_data = model_info['well_data'][well]
+                
+                # Фильтруем модельные даты по диапазону фактических дат
+                if min_fact_date and max_fact_date:
+                    # Создаем Series для фильтрации дат
+                    date_series = pd.Series(model_dates)
+                    date_mask = (date_series >= min_fact_date) & (date_series <= max_fact_date)
+                    filtered_dates = date_series[date_mask].tolist()
+                    
+                    print(f"      Модель {model_name}: отобрано {len(filtered_dates)} из {len(model_dates)} дат")
+                else:
+                    filtered_dates = model_dates
+                
+                if not filtered_dates:
+                    continue
+                
+                # Сопоставляем даты с индексами
+                date_indices = []
+                for date in filtered_dates:
+                    try:
+                        idx = model_dates.index(date)
+                        date_indices.append(idx)
+                    except ValueError:
+                        continue
+                
+                # Для каждого параметра
+                for param, all_values in well_data.items():
+                    if len(all_values) != len(model_dates):
+                        print(f"    Предупреждение: несоответствие размеров для модели {model_name}, скважина {well}, параметр {param}")
+                        continue
+                    
+                    # Сопоставляем имена параметров
+                    if param == 'wbp':
+                        param_display = 'pressure'
+                    elif param == 'wgpr':
+                        param_display = 'gas_rate'
+                    elif param == 'wgir':
+                        param_display = 'gas_injection'
+                    else:
+                        param_display = param
+                    
+                    # Добавляем записи для отфильтрованных дат
+                    for idx in date_indices:
+                        date = model_dates[idx]
+                        value = all_values[idx]
+                        
+                        # Пропускаем NaN значения
+                        if pd.isna(value):
+                            continue
+                            
+                        all_records.append({
+                            'date': date,
+                            'model': model_name,
+                            'parameter': param_display,
+                            'value': value
+                        })
+        
+        # Создаем DataFrame для скважины
+        if all_records:
+            df_well = pd.DataFrame(all_records)
+            df_well = df_well.sort_values(['date', 'parameter', 'model']).reset_index(drop=True)
+            
+            # Выводим статистику
+            fact_count = len(df_well[df_well['model'] == 'HISTORICAL'])
+            model_count = len(df_well[df_well['model'] != 'HISTORICAL'])
+            print(f"    Скважина {well}: {len(df_well)} записей ({fact_count} факт, {model_count} модель)")
+            
+            well_dataframes[well] = df_well
+        else:
+            print(f"    Предупреждение: нет данных для скважины {well}")
+    
+    return well_dataframes
+
+
+def get_unified_data_per_well_without_interpolation(model_names, historical_df,
+                                                  well_column='well_fact',
+                                                  date_column='date_fact',
+                                                  pressure_column='wpb_bar_fact'):
+    """
+    Основная функция: получить унифицированные данные, сгруппированные по скважинам
+    БЕЗ интерполяции - берем фактические даты и модельные даты как есть
+    """
+    print("=" * 60)
+    print("ПОЛУЧЕНИЕ УНИФИЦИРОВАННЫХ ДАННЫХ ПО СКВАЖИНАМ (БЕЗ ИНТЕРПОЛЯЦИИ)")
+    print("=" * 60)
+    
+    # 1. Получаем список скважин из фактических данных
+    well_names = get_unique_fact_wells(historical_df)
+    if not well_names:
+        print("Ошибка: не удалось получить список скважин из фактических данных")
+        return {}, {}
+    
+    print(f"Скважины для анализа: {well_names}")
+    
+    # 2. Загружаем сырые данные из моделей
+    print("\n2. Загрузка сырых данных из моделей...")
+    models_raw = get_raw_model_data(model_names, well_names, ['wbp', 'wgpr', 'wgir'])
+    
+    if not models_raw:
+        print("Ошибка: не удалось загрузить данные моделей")
+        return {}, {}
+    
+    print(f"Загружены данные из {len(models_raw)} моделей")
+    
+    # 3. Создаем объединенные DataFrame по скважинам (без интерполяции)
+    print("\n3. Создание объединенных DataFrame по скважинам (без интерполяции)...")
+    well_dataframes = create_combined_dataframe_per_well_without_interpolation(
+        models_raw, historical_df,
+        well_column=well_column,
+        date_column=date_column,
+        pressure_column=pressure_column
+    )
+    
+    print(f"Созданы DataFrame для {len(well_dataframes)} скважин")
+    
+    # 4. Выводим информацию о загруженных параметрах
+    print("\n4. Анализ загруженных параметров...")
+    param_stats = {}
+    for well, df_well in well_dataframes.items():
+        params = df_well['parameter'].unique()
+        for param in params:
+            if param not in param_stats:
+                param_stats[param] = set()
+            param_stats[param].add(well)
+    
+    print("Загружены следующие параметры:")
+    for param, wells in param_stats.items():
+        print(f"  {param}: {len(wells)} скважин")
+    
+    return well_dataframes, models_raw
+
+
+def smooth_pressure_timeseries(df):
+    """
+    Создает сглаженную кривую для временного ряда давления.
+    Сглаживание применяется только к существующим данным, но значения
+    сглаженной кривой вычисляются для всех дат.
+    
+    Параметры:
+    -----------
+    df : pandas.DataFrame
+        Датафрейм с колонками 'date' (строки в формате ДД.ММ.ГГГГ) и 'pressure_fact'
+    
+    Возвращает:
+    -----------
+    pandas.DataFrame
+        Исходный датафрейм с добавленной колонкой 'pressure_smoothed'
+    """
+    # Создаем копию датафрейма
+    df_result = df.copy()
+    
+    # Преобразуем даты в datetime
+    df_result['date_dt'] = pd.to_datetime(df_result['date'], format='%d.%m.%Y')
+    
+    # Сортируем по дате
+    df_result = df_result.sort_values('date_dt').reset_index(drop=True)
+    
+    # Шаг 1: Получаем только фактические данные (без NaN)
+    fact_mask = df_result['pressure_fact'].notna()
+    fact_dates = df_result.loc[fact_mask, 'date_dt']
+    fact_pressures = df_result.loc[fact_mask, 'pressure_fact'].values
+    
+    # Проверяем, достаточно ли точек для сглаживания
+    if len(fact_pressures) < MIN_POINTS_FOR_SMOOTHING:
+        warnings.warn(f"Недостаточно точек для сглаживания. Доступно: {len(fact_pressures)}, требуется: {MIN_POINTS_FOR_SMOOTHING}")
+        # Если точек недостаточно, используем простую линейную интерполяцию
+        df_result['pressure_smoothed'] = np.nan
+        # Интерполируем только между фактическими точками
+        if len(fact_pressures) >= 2:
+            # Создаем временную шкалу в днях от первой даты
+            all_dates_numeric = (df_result['date_dt'] - df_result['date_dt'].min()).dt.days.values
+            fact_dates_numeric = (fact_dates - df_result['date_dt'].min()).dt.days.values
+            
+            # Линейная интерполяция
+            interp_func = interp1d(fact_dates_numeric, fact_pressures, 
+                                  kind='linear', bounds_error=False, 
+                                  fill_value='extrapolate')
+            
+            # Получаем значения для всех дат
+            smoothed_all = interp_func(all_dates_numeric)
+            df_result['pressure_smoothed'] = smoothed_all
+        
+        df_result.drop(columns=['date_dt'], inplace=True)
+        return df_result
+    
+    # Шаг 2: Создаем числовую временную шкалу для фактических точек
+    # Используем дни от первой фактической даты
+    first_fact_date = fact_dates.iloc[0]
+    fact_dates_numeric = (fact_dates - first_fact_date).dt.days.values
+    
+    # Шаг 3: Создаем равномерную временную шкалу для сглаживания
+    # (фильтр Савицкого-Голея требует равномерной сетки)
+    min_date_num = fact_dates_numeric.min()
+    max_date_num = fact_dates_numeric.max()
+    
+    # Создаем равномерную сетку с шагом 1 день
+    uniform_dates_num = np.arange(min_date_num, max_date_num + 1)
+    
+    # Интерполируем фактические данные на равномерную сетку
+    # (только для целей сглаживания)
+    interp_func_uniform = interp1d(fact_dates_numeric, fact_pressures, 
+                                  kind=SMOOTHING_INTERP_METHOD, 
+                                  bounds_error=False, 
+                                  fill_value='extrapolate')
+    
+    pressures_uniform = interp_func_uniform(uniform_dates_num)
+    
+    # Шаг 4: Применяем фильтр Савицкого-Голея к равномерной сетке
+    # Настраиваем размер окна
+    window_length = min(SMOOTHING_WINDOW, len(pressures_uniform))
+    if window_length % 2 == 0:
+        window_length -= 1  # Делаем нечетным
+        if window_length < 3:
+            window_length = 3
+    
+    # Убедимся, что порядок полинома меньше размера окна
+    polyorder = min(SMOOTHING_POLYORDER, window_length - 1)
+    
+    try:
+        smoothed_uniform = savgol_filter(pressures_uniform, 
+                                        window_length=window_length,
+                                        polyorder=polyorder,
+                                        mode='interp')
+    except Exception as e:
+        warnings.warn(f"Ошибка при сглаживании: {str(e)}. Использую интерполированные значения.")
+        smoothed_uniform = pressures_uniform
+    
+    # Шаг 5: Создаем интерполяционную функцию для сглаженной кривой
+    # (снова используем фактическую временную шкалу)
+    # Создаем функцию, которая интерполирует сглаженные значения
+    # на основе равномерной сетки
+    interp_smoothed = interp1d(uniform_dates_num, smoothed_uniform,
+                              kind=SMOOTHING_INTERP_METHOD,
+                              bounds_error=False,
+                              fill_value='extrapolate')
+    
+    # Шаг 6: Вычисляем сглаженные значения для всех дат (включая пропуски)
+    all_dates_numeric = (df_result['date_dt'] - first_fact_date).dt.days.values
+    smoothed_all = interp_smoothed(all_dates_numeric)
+    
+    # Ограничиваем значения разумными пределами
+    min_pressure = max(0, np.nanmin(fact_pressures) * 0.5)
+    max_pressure = np.nanmax(fact_pressures) * 1.5
+    smoothed_all = np.clip(smoothed_all, min_pressure, max_pressure)
+    
+    df_result['pressure_smoothed'] = smoothed_all
+    
+    # Шаг 7: Убедимся, что сглаженная кривая не имеет NaN
+    # (интерполяция с fill_value='extrapolate' должна это обеспечить)
+    if df_result['pressure_smoothed'].isna().any():
+        # Заполняем оставшиеся NaN линейной интерполяцией
+        df_result['pressure_smoothed'] = df_result['pressure_smoothed'].interpolate(
+            method='linear', limit_direction='both'
+        )
+    
+    # Удаляем вспомогательные колонки
+    df_result.drop(columns=['date_dt'], inplace=True)
+    
+    return df_result
+
+
+def find_extremes_improved_v2(df, min_distance_days=MIN_DISTANCE_DAYS, 
+                              prominence_percent=PROMINENCE_PERCENT, 
+                              max_cycle_days=MAX_CYCLE_DAYS, 
+                              edge_buffer_days=EDGE_BUFFER_DAYS):
+    """
+    Улучшенный алгоритм поиска экстремумов для циклических данных с годовыми циклами.
+    
+    Параметры:
+    ----------
+    df : pandas.DataFrame
+        Датафрейм с колонками ['date', 'pressure_smoothed']
+    min_distance_days : int
+        Минимальное расстояние между экстремумами в днях (по умолчанию 60)
+    prominence_percent : float
+        Минимальная значимость экстремума в процентах от среднего значения (по умолчанию 2%)
+    max_cycle_days : int
+        Максимальная длина цикла в днях (по умолчанию 400)
+    edge_buffer_days : int
+        Буфер для обработки краев данных в днях (по умолчанию 30)
+    
+    Возвращает:
+    -----------
+    pandas.DataFrame
+        Датафрейм с добавленными колонками 'maxima' и 'minima'
+    """
+    
+    # Копируем датафрейм
+    result_df = df.copy()
+    
+    # Преобразуем дату
+    if not pd.api.types.is_datetime64_any_dtype(result_df['date']):
+        # Пробуем разные форматы дат
+        try:
+            result_df['date'] = pd.to_datetime(result_df['date'], format='%d.%m.%Y')
+        except:
+            result_df['date'] = pd.to_datetime(result_df['date'])
+    
+    # Сортируем по дате
+    result_df = result_df.sort_values('date').reset_index(drop=True)
+    
+    # Инициализируем колонки
+    result_df['maxima'] = np.nan
+    result_df['minima'] = np.nan
+    
+    # Получаем значения
+    pressures = result_df['pressure_smoothed'].values
+    dates = result_df['date'].values
+    n = len(pressures)
+    
+    if n < 10:
+        print("Слишком мало данных для поиска экстремумов")
+        return result_df
+    
+    # Вычисляем среднее значение для определения значимости
+    avg_pressure = np.nanmean(pressures)
+    min_prominence = avg_pressure * (prominence_percent / 100)
+    
+    # Конвертируем расстояние в днях в индексы
+    if n > 1:
+        avg_days_between_points = (dates[-1] - dates[0]).astype('timedelta64[D]').astype(int) / (n - 1)
+        min_distance_points = max(5, int(min_distance_days / avg_days_between_points))
+    else:
+        min_distance_points = 30
+    
+    print(f"  Всего точек: {n}")
+    print(f"  Среднее давление: {avg_pressure:.2f}")
+    print(f"  Минимальная значимость: {min_prominence:.2f}")
+    print(f"  Минимальное расстояние в точках: {min_distance_points}")
+    
+    # Инициализируем списки для экстремумов
+    all_maxima_indices = []
+    all_minima_indices = []
+    
+    # 1. Поиск с помощью scipy.signal.find_peaks (основной метод)
+    try:
+        # Находим максимумы
+        max_peaks, max_properties = find_peaks(
+            pressures, 
+            distance=min_distance_points,
+            prominence=min_prominence,
+            width=min_distance_points//3,  # Учитываем ширину пика
+            rel_height=0.5
+        )
+        
+        # Находим минимумы (инвертируем сигнал)
+        min_peaks, min_properties = find_peaks(
+            -pressures, 
+            distance=min_distance_points,
+            prominence=min_prominence,
+            width=min_distance_points//3,
+            rel_height=0.5
+        )
+        
+        all_maxima_indices = list(max_peaks)
+        all_minima_indices = list(min_peaks)
+        
+        print(f"  Найдено {len(all_maxima_indices)} максимумов и {len(all_minima_indices)} минимумов через find_peaks")
+        
+    except Exception as e:
+        print(f"  Ошибка при использовании find_peaks: {e}")
+        all_maxima_indices = []
+        all_minima_indices = []
+    
+    # 2. Дополнительный поиск по годовым циклам
+    years = result_df['date'].dt.year.unique()
+    yearly_extremes = []
+    
+    for year in years:
+        year_mask = result_df['date'].dt.year == year
+        year_indices = np.where(year_mask)[0]
+        
+        if len(year_indices) > 30:  # Минимум 30 точек в году
+            year_pressures = pressures[year_indices]
+            
+            # Находим максимум года
+            year_max_idx_local = np.argmax(year_pressures)
+            year_max_idx = year_indices[year_max_idx_local]
+            year_max_val = year_pressures[year_max_idx_local]
+            
+            # Находим минимум года
+            year_min_idx_local = np.argmin(year_pressures)
+            year_min_idx = year_indices[year_min_idx_local]
+            year_min_val = year_pressures[year_min_idx_local]
+            
+            # Проверяем, что это действительно экстремум в окрестности
+            window_size = min(50, len(year_indices)//3)
+            
+            # Для максимума
+            if year_max_idx_local >= window_size and year_max_idx_local < len(year_indices) - window_size:
+                window = year_pressures[year_max_idx_local-window_size:year_max_idx_local+window_size+1]
+                if year_max_val == np.max(window):
+                    yearly_extremes.append((year_max_idx, 'max', year_max_val))
+            
+            # Для минимума
+            if year_min_idx_local >= window_size and year_min_idx_local < len(year_indices) - window_size:
+                window = year_pressures[year_min_idx_local-window_size:year_min_idx_local+window_size+1]
+                if year_min_val == np.min(window):
+                    yearly_extremes.append((year_min_idx, 'min', year_min_val))
+    
+    print(f"  Найдено {len([e for e in yearly_extremes if e[1]=='max'])} максимумов и "
+          f"{len([e for e in yearly_extremes if e[1]=='min'])} минимумов по годам")
+    
+    # 3. Проверка краевых точек
+    edge_extremes = []
+    
+    # Проверяем первые edge_buffer_days дней
+    edge_points = int(edge_buffer_days / avg_days_between_points) if avg_days_between_points > 0 else 30
+    edge_points = min(edge_points, n//4)
+    
+    if edge_points > 5:
+        # Проверяем начало данных
+        start_window = pressures[:edge_points*2]
+        if len(start_window) > 0:
+            start_max_idx = np.argmax(start_window)
+            start_max_val = start_window[start_max_idx]
+            start_min_idx = np.argmin(start_window)
+            start_min_val = start_window[start_min_idx]
+            
+            # Проверяем значимость
+            if start_max_idx > 0 and start_max_idx < len(start_window)-1:
+                if start_max_val - start_min_val > min_prominence:
+                    edge_extremes.append((start_max_idx, 'max', start_max_val))
+                    edge_extremes.append((start_min_idx, 'min', start_min_val))
+        
+        # Проверяем конец данных
+        end_window = pressures[-edge_points*2:]
+        if len(end_window) > 0:
+            end_max_idx = n - len(end_window) + np.argmax(end_window)
+            end_max_val = pressures[end_max_idx]
+            end_min_idx = n - len(end_window) + np.argmin(end_window)
+            end_min_val = pressures[end_min_idx]
+            
+            if end_max_idx > n - len(end_window) and end_max_idx < n-1:
+                if end_max_val - end_min_val > min_prominence:
+                    edge_extremes.append((end_max_idx, 'max', end_max_val))
+                    edge_extremes.append((end_min_idx, 'min', end_min_val))
+    
+    print(f"  Найдено {len([e for e in edge_extremes if e[1]=='max'])} максимумов и "
+          f"{len([e for e in edge_extremes if e[1]=='min'])} минимумов на краях")
+    
+    # 4. Объединяем все найденные экстремумы
+    all_extrema_dict = {'max': [], 'min': []}
+    
+    # Добавляем экстремумы из find_peaks
+    for idx in all_maxima_indices:
+        all_extrema_dict['max'].append((idx, pressures[idx]))
+    for idx in all_minima_indices:
+        all_extrema_dict['min'].append((idx, pressures[idx]))
+    
+    # Добавляем годовые экстремумы
+    for idx, typ, val in yearly_extremes:
+        all_extrema_dict[typ].append((idx, val))
+    
+    # Добавляем краевые экстремумы
+    for idx, typ, val in edge_extremes:
+        all_extrema_dict[typ].append((idx, val))
+    
+    # Удаляем дубликаты и сортируем
+    for typ in ['max', 'min']:
+        if all_extrema_dict[typ]:
+            # Удаляем дубликаты по индексу
+            unique_dict = {}
+            for idx, val in all_extrema_dict[typ]:
+                if idx not in unique_dict:
+                    unique_dict[idx] = val
+                elif typ == 'max' and val > unique_dict[idx]:
+                    unique_dict[idx] = val
+                elif typ == 'min' and val < unique_dict[idx]:
+                    unique_dict[idx] = val
+            
+            # Сортируем по индексу
+            all_extrema_dict[typ] = sorted([(idx, val) for idx, val in unique_dict.items()])
+    
+    print(f"  После объединения: {len(all_extrema_dict['max'])} максимумов и {len(all_extrema_dict['min'])} минимумов")
+    
+    # 5. Фильтрация и чередование экстремумов
+    filtered_maxima = []
+    filtered_minima = []
+    
+    # Объединяем все экстремумы в один отсортированный список
+    combined_extrema = []
+    for idx, val in all_extrema_dict['max']:
+        combined_extrema.append((idx, 'max', val))
+    for idx, val in all_extrema_dict['min']:
+        combined_extrema.append((idx, 'min', val))
+    
+    combined_extrema.sort(key=lambda x: x[0])
+    
+    # Алгоритм чередования с допущениями
+    i = 0
+    last_type = None
+    last_idx = -min_distance_points * 2
+    
+    while i < len(combined_extrema):
+        idx, typ, val = combined_extrema[i]
+        
+        # Проверяем расстояние до предыдущего экстремума
+        if idx - last_idx < min_distance_points:
+            # Если слишком близко, выбираем более значимый
+            if last_type == 'max' and typ == 'max':
+                # Два максимума рядом - выбираем больший
+                if val > pressures[last_idx]:
+                    # Удаляем предыдущий, добавляем текущий
+                    if last_idx in filtered_maxima:
+                        filtered_maxima.remove(last_idx)
+                    filtered_maxima.append(idx)
+                    last_idx = idx
+                # Иначе пропускаем текущий
+            elif last_type == 'min' and typ == 'min':
+                # Два минимума рядом - выбираем меньший
+                if val < pressures[last_idx]:
+                    if last_idx in filtered_minima:
+                        filtered_minima.remove(last_idx)
+                    filtered_minima.append(idx)
+                    last_idx = idx
+            i += 1
+            continue
+        
+        # Проверяем чередование
+        if last_type is None or typ != last_type:
+            # Если это первый экстремум или типы чередуются
+            if typ == 'max':
+                filtered_maxima.append(idx)
+            else:
+                filtered_minima.append(idx)
+            
+            last_type = typ
+            last_idx = idx
+            i += 1
+        else:
+            # Если типы не чередуются, проверяем следующий экстремум
+            # Ищем ближайший экстремум другого типа в пределах max_cycle_days
+            found_alternate = False
+            max_search = min(i + 20, len(combined_extrema))
+            
+            for j in range(i + 1, max_search):
+                idx2, typ2, val2 = combined_extrema[j]
+                
+                # Проверяем расстояние в днях
+                days_diff = (dates[idx2] - dates[idx]).astype('timedelta64[D]').astype(int)
+                
+                if typ2 != typ and 30 < days_diff < max_cycle_days:
+                    # Нашли чередующийся экстремум
+                    if typ2 == 'max':
+                        filtered_maxima.append(idx2)
+                    else:
+                        filtered_minima.append(idx2)
+                    
+                    last_type = typ2
+                    last_idx = idx2
+                    i = j + 1
+                    found_alternate = True
+                    break
+            
+            if not found_alternate:
+                # Если не нашли чередующийся, пропускаем текущий
+                i += 1
+    
+    # 6. Дополнительная проверка пропущенных экстремумов
+    # Ищем крупные пропуски между экстремумами
+    all_filtered = sorted([(idx, 'max', pressures[idx]) for idx in filtered_maxima] + 
+                         [(idx, 'min', pressures[idx]) for idx in filtered_minima])
+    
+    for k in range(len(all_filtered) - 1):
+        idx1, typ1, val1 = all_filtered[k]
+        idx2, typ2, val2 = all_filtered[k + 1]
+        
+        # Вычисляем расстояние в днях
+        days_diff = (dates[idx2] - dates[idx1]).astype('timedelta64[D]').astype(int)
+        
+        # Если большой пропуск (> 250 дней), ищем экстремум в середине
+        if days_diff > 250 and typ1 != typ2:
+            mid_idx = (idx1 + idx2) // 2
+            search_start = max(0, mid_idx - min_distance_points)
+            search_end = min(n, mid_idx + min_distance_points)
+            
+            if search_end - search_start > 10:
+                if typ1 == 'max':
+                    # Между максимумом и минимумом должен быть минимум
+                    search_min_idx = search_start + np.argmin(pressures[search_start:search_end])
+                    search_min_val = pressures[search_min_idx]
+                    
+                    # Проверяем значимость
+                    if val1 - search_min_val > min_prominence and val2 - search_min_val > min_prominence:
+                        if search_min_idx not in filtered_minima:
+                            filtered_minima.append(search_min_idx)
+                else:
+                    # Между минимумом и максимумом должен быть максимум
+                    search_max_idx = search_start + np.argmax(pressures[search_start:search_end])
+                    search_max_val = pressures[search_max_idx]
+                    
+                    # Проверяем значимость
+                    if search_max_val - val1 > min_prominence and search_max_val - val2 > min_prominence:
+                        if search_max_idx not in filtered_maxima:
+                            filtered_maxima.append(search_max_idx)
+    
+    # 7. Сортировка и удаление дубликатов
+    filtered_maxima = sorted(list(set(filtered_maxima)))
+    filtered_minima = sorted(list(set(filtered_minima)))
+    
+    print(f"  После фильтрации: {len(filtered_maxima)} максимумов и {len(filtered_minima)} минимумов")
+    
+    # 8. Заполняем датафрейм
+    for idx in filtered_maxima:
+        if 0 <= idx < n:
+            result_df.loc[idx, 'maxima'] = pressures[idx]
+    
+    for idx in filtered_minima:
+        if 0 <= idx < n:
+            result_df.loc[idx, 'minima'] = pressures[idx]
+    
+    # 9. Дополнительная информация для отладки
+    if len(filtered_maxima) > 0 and len(filtered_minima) > 0:
+        print(f"  Первый максимум: {result_df.loc[filtered_maxima[0], 'date'].strftime('%d.%m.%Y')} = {pressures[filtered_maxima[0]]:.2f}")
+        print(f"  Последний максимум: {result_df.loc[filtered_maxima[-1], 'date'].strftime('%d.%m.%Y')} = {pressures[filtered_maxima[-1]]:.2f}")
+        print(f"  Первый минимум: {result_df.loc[filtered_minima[0], 'date'].strftime('%d.%m.%Y')} = {pressures[filtered_minima[0]]:.2f}")
+        print(f"  Последний минимум: {result_df.loc[filtered_minima[-1], 'date'].strftime('%d.%m.%Y')} = {pressures[filtered_minima[-1]]:.2f}")
+    
+    return result_df
+
+
+def compute_smoothed_pressures_and_extremes(well_dataframes, historical_df):
+    """
+    Вычисляет сглаженные значения давления и экстремумы для каждой скважины
+    
+    Parameters:
+    -----------
+    well_dataframes : dict
+        DataFrame по скважинам
+    historical_df : pd.DataFrame
+        Исторические данные с фактическими давлениями
+        
+    Returns:
+    --------
+    tuple
+        (smoothed_pressures, extremes_data)
+        smoothed_pressures: словарь с ключами - имена скважин, значения - словари с датами и сглаженными значениями
+        extremes_data: словарь с ключами - имена скважин, значения - словари с датами и экстремумами
+    """
+    smoothed_pressures = {}
+    extremes_data = {}
+    
+    for well_name, df_well in well_dataframes.items():
+        print(f"  Обработка скважины {well_name}...")
+        
+        # Извлекаем исторические данные для этой скважины
+        historical_data_well = historical_df[historical_df['well_fact'] == well_name].copy()
+        
+        if historical_data_well.empty:
+            print(f"    Предупреждение: нет исторических данных для скважины {well_name}")
+            smoothed_pressures[well_name] = {}
+            extremes_data[well_name] = {'maxima': {}, 'minima': {}}
+            continue
+        
+        # Получаем все уникальные даты для этой скважины из well_dataframes
+        all_dates_for_well = df_well['date'].unique()
+        
+        if len(all_dates_for_well) == 0:
+            print(f"    Предупреждение: для скважины {well_name} нет дат в well_dataframes")
+            smoothed_pressures[well_name] = {}
+            extremes_data[well_name] = {'maxima': {}, 'minima': {}}
+            continue
+        
+        # Создаем DataFrame с ВСЕМИ датами (не только историческими)
+        # в формате, ожидаемом функцией smooth_pressure_timeseries
+        pressure_data = []
+        
+        # Преобразуем исторические даты в datetime для корректного сравнения
+        historical_data_well['date_fact_dt'] = pd.to_datetime(historical_data_well['date_fact'])
+        
+        for date in all_dates_for_well:
+            # Приводим все даты к единому формату datetime
+            if isinstance(date, (pd.Timestamp, datetime)):
+                date_dt = date
+            elif isinstance(date, np.datetime64):
+                date_dt = pd.Timestamp(date)
+            else:
+                try:
+                    date_dt = pd.to_datetime(date)
+                except:
+                    print(f"    Предупреждение: не удалось преобразовать дату {date} для скважины {well_name}")
+                    continue
+            
+            # Ищем историческое давление для этой даты
+            hist_pressure = None
+            
+            # Ищем точное совпадение даты
+            exact_match = historical_data_well[historical_data_well['date_fact_dt'] == date_dt]
+            if not exact_match.empty:
+                hist_pressure = exact_match.iloc[0]['wpb_bar_fact']
+            else:
+                # Ищем ближайшую дату (в пределах 1 дня)
+                time_diffs = (historical_data_well['date_fact_dt'] - date_dt).abs()
+                min_diff_idx = time_diffs.idxmin() if not time_diffs.empty else None
+                if min_diff_idx is not None and time_diffs[min_diff_idx] <= pd.Timedelta(days=1):
+                    hist_pressure = historical_data_well.loc[min_diff_idx, 'wpb_bar_fact']
+            
+            # Сохраняем дату в строковом формате для функции smooth_pressure_timeseries
+            pressure_data.append({
+                'date': date_dt.strftime('%d.%m.%Y'),
+                'pressure_fact': hist_pressure
+            })
+        
+        if not pressure_data:
+            print(f"    Предупреждение: не удалось создать данные для сглаживания скважины {well_name}")
+            smoothed_pressures[well_name] = {}
+            extremes_data[well_name] = {'maxima': {}, 'minima': {}}
+            continue
+        
+        # Создаем DataFrame для сглаживания
+        pressure_df = pd.DataFrame(pressure_data)
+        
+        # Применяем сглаживание
+        try:
+            smoothed_df = smooth_pressure_timeseries(pressure_df)
+            
+            # Поиск экстремумов в сглаженных данных
+            extremes_df = find_extremes_improved_v2(smoothed_df)
+            
+            # Создаем словарь для быстрого доступа к сглаженным значениям по дате
+            smoothed_dict = {}
+            maxima_dict = {}
+            minima_dict = {}
+            
+            for _, row in extremes_df.iterrows():
+                date_str = row['date']
+                # Преобразуем дату обратно в datetime для использования в качестве ключа
+                if isinstance(date_str, str):
+                    try:
+                        date_dt = datetime.strptime(date_str, '%d.%m.%Y')
+                    except:
+                        date_dt = pd.to_datetime(date_str)
+                else:
+                    date_dt = date_str
+                
+                # Приводим к единому формату datetime для использования в качестве ключа
+                if isinstance(date_dt, (pd.Timestamp, datetime)):
+                    # Преобразуем в строку YYYY-MM-DD для единообразия
+                    date_key = date_dt.strftime('%Y-%m-%d')
+                elif isinstance(date_dt, np.datetime64):
+                    date_key = pd.Timestamp(date_dt).strftime('%Y-%m-%d')
+                else:
+                    date_key = str(date_dt)
+                
+                smoothed_value = row['pressure_smoothed']
+                smoothed_dict[date_key] = smoothed_value
+                
+                # Сохраняем экстремумы, если они есть
+                if pd.notna(row['maxima']):
+                    maxima_dict[date_key] = row['maxima']
+                if pd.notna(row['minima']):
+                    minima_dict[date_key] = row['minima']
+            
+            smoothed_pressures[well_name] = smoothed_dict
+            extremes_data[well_name] = {
+                'maxima': maxima_dict,
+                'minima': minima_dict
+            }
+            
+            print(f"    ✓ Скважина {well_name}: {len(smoothed_dict)} сглаженных значений, "
+                  f"{len(maxima_dict)} максимумов, {len(minima_dict)} минимумов")
+            
+            # Отладочная информация для первых нескольких значений
+            if len(smoothed_dict) > 0:
+                sample_dates = list(smoothed_dict.keys())[:3]
+                print(f"      Пример сглаженных: {sample_dates[0]} -> {smoothed_dict[sample_dates[0]]:.2f}")
+            
+            if len(maxima_dict) > 0:
+                sample_max = list(maxima_dict.keys())[0]
+                print(f"      Пример максимума: {sample_max} -> {maxima_dict[sample_max]:.2f}")
+            
+            if len(minima_dict) > 0:
+                sample_min = list(minima_dict.keys())[0]
+                print(f"      Пример минимума: {sample_min} -> {minima_dict[sample_min]:.2f}")
+            
+        except Exception as e:
+            print(f"    Ошибка при обработке данных для скважины {well_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            smoothed_pressures[well_name] = {}
+            extremes_data[well_name] = {'maxima': {}, 'minima': {}}
+    
+    return smoothed_pressures, extremes_data
+
+
+def compute_model_extremes(well_dataframes):
+    """
+    Вычисляет экстремумы для модельных давлений каждой скважины
+    
+    Parameters:
+    -----------
+    well_dataframes : dict
+        DataFrame по скважинам
+        
+    Returns:
+    --------
+    dict
+        Словарь с экстремумами модельных давлений:
+        model_extremes[well_name][model_name] = {'maxima': {date: value}, 'minima': {date: value}}
+    """
+    print("  Вычисление экстремумов для модельных давлений...")
+    model_extremes = {}
+    
+    for well_name, df_well in well_dataframes.items():
+        print(f"    Обработка скважины {well_name}...")
+        
+        # Получаем список моделей для этой скважины
+        models_for_well = df_well['model'].unique()
+        models_for_well = [m for m in models_for_well if m != 'HISTORICAL']
+        
+        if not models_for_well:
+            print(f"      Предупреждение: для скважины {well_name} нет модельных данных")
+            model_extremes[well_name] = {}
+            continue
+        
+        model_extremes[well_name] = {}
+        
+        for model_name in models_for_well:
+            print(f"      Модель {model_name}...")
+            
+            # Фильтруем данные для этой модели и параметра давления
+            model_pressure_df = df_well[
+                (df_well['model'] == model_name) & 
+                (df_well['parameter'] == 'pressure')
+            ].copy()
+            
+            if model_pressure_df.empty:
+                print(f"        Предупреждение: нет данных давления для модели {model_name}")
+                model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
+                continue
+            
+            # Подготавливаем данные для поиска экстремумов
+            # Создаем DataFrame в формате, ожидаемом функцией find_extremes_improved_v2
+            pressure_data = []
+            
+            for _, row in model_pressure_df.iterrows():
+                date = row['date']
+                value = row['value']
+                
+                # Пропускаем NaN значения
+                if pd.isna(value):
+                    continue
+                
+                # Преобразуем дату в строковый формат
+                if isinstance(date, (pd.Timestamp, datetime)):
+                    date_str = date.strftime('%d.%m.%Y')
+                elif isinstance(date, np.datetime64):
+                    date_str = pd.Timestamp(date).strftime('%d.%m.%Y')
+                else:
+                    date_str = str(date)
+                
+                pressure_data.append({
+                    'date': date_str,
+                    'pressure_smoothed': value  # Используем исходное значение давления
+                })
+            
+            if len(pressure_data) < 10:
+                print(f"        Предупреждение: недостаточно данных для поиска экстремумов ({len(pressure_data)} точек)")
+                model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
+                continue
+            
+            # Создаем DataFrame для поиска экстремумов
+            pressure_df = pd.DataFrame(pressure_data)
+            
+            try:
+                # Ищем экстремумы
+                extremes_df = find_extremes_improved_v2(pressure_df)
+                
+                # Создаем словари для экстремумов
+                maxima_dict = {}
+                minima_dict = {}
+                
+                for _, row in extremes_df.iterrows():
+                    date_str = row['date']
+                    # Преобразуем дату в строковый формат YYYY-MM-DD для ключа
+                    if isinstance(date_str, str):
+                        try:
+                            # Пробуем преобразовать из формата DD.MM.YYYY
+                            date_dt = datetime.strptime(date_str, '%d.%m.%Y')
+                            date_key = date_dt.strftime('%Y-%m-%d')
+                        except:
+                            # Пробуем преобразовать из других форматов
+                            try:
+                                date_dt = pd.to_datetime(date_str)
+                                date_key = date_dt.strftime('%Y-%m-%d')
+                            except:
+                                date_key = date_str
+                    else:
+                        # Если это не строка, пробуем преобразовать
+                        try:
+                            date_dt = pd.to_datetime(date_str)
+                            date_key = date_dt.strftime('%Y-%m-%d')
+                        except:
+                            date_key = str(date_str)
+                    
+                    # Сохраняем экстремумы
+                    if pd.notna(row['maxima']):
+                        maxima_dict[date_key] = row['maxima']
+                    if pd.notna(row['minima']):
+                        minima_dict[date_key] = row['minima']
+                
+                model_extremes[well_name][model_name] = {
+                    'maxima': maxima_dict,
+                    'minima': minima_dict
+                }
+                
+                print(f"        ✓ Найдено {len(maxima_dict)} максимумов и {len(minima_dict)} минимумов")
+                
+                if len(maxima_dict) > 0:
+                    sample_max_date = list(maxima_dict.keys())[0]
+                    sample_max_value = maxima_dict[sample_max_date]
+                    print(f"          Пример максимума: {sample_max_date} -> {sample_max_value:.2f}")
+                
+                if len(minima_dict) > 0:
+                    sample_min_date = list(minima_dict.keys())[0]
+                    sample_min_value = minima_dict[sample_min_date]
+                    print(f"          Пример минимума: {sample_min_date} -> {sample_min_value:.2f}")
+                
+            except Exception as e:
+                print(f"        Ошибка при поиске экстремумов для модели {model_name}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
+    
+    print(f"  Вычисление экстремумов для модельных давлений завершено")
+    return model_extremes
+
+
+def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models_data, 
+                                        output_path="structured_comparison_single_sheet.xlsx"):
+    """
+    Сохранить данные в Excel файл на один лист с указанной структурой в виде единой таблицы:
+    1 строка: well, date, wbp_hist, wbp_hist_smoothed, wbp_hist_smoothed_max, wbp_hist_smoothed_min, 
+              model_name1, "", "", "", "", model_name2, "", "", "", "", ...
+    2 строка: "", "", "", "", "", "", wbp_model, wbp_model_max, wbp_model_min, wgpr_model, wgir_model, 
+              wbp_model, wbp_model_max, wbp_model_min, wgpr_model, wgir_model...
+    А ниже данные по всем скважинам в единой таблице.
+    
+    Parameters:
+    -----------
+    well_dataframes : dict
+        DataFrame по скважинам
+    historical_df : pd.DataFrame
+        Исторические данные
+    models_data : dict
+        Сырые данные моделей
+    output_path : str
+        Путь для сохранения Excel файл
+    """
+    print(f"\nСохранение данных в Excel файл (единая таблица): {output_path}")
+    
+    # Вычисляем сглаженные давления и экстремумы
+    print("  Вычисление сглаженных давлений и экстремумов...")
+    smoothed_pressures, extremes_data = compute_smoothed_pressures_and_extremes(well_dataframes, historical_df)
+    
+    # Вычисляем экстремумы для модельных давлений
+    model_extremes = compute_model_extremes(well_dataframes)
+    
+    # Отладочная информация о сглаженных данных и экстремумах
+    print(f"  Информация о сглаженных данных и экстремумах:")
+    for well_name in smoothed_pressures.keys():
+        smoothed_count = len(smoothed_pressures[well_name])
+        maxima_count = len(extremes_data[well_name]['maxima'])
+        minima_count = len(extremes_data[well_name]['minima'])
+        print(f"    {well_name}: {smoothed_count} сглаженных, {maxima_count} максимумов, {minima_count} минимумов")
+        
+        # Информация о модельных экстремумах
+        if well_name in model_extremes:
+            for model_name in model_extremes[well_name]:
+                model_max = len(model_extremes[well_name][model_name]['maxima'])
+                model_min = len(model_extremes[well_name][model_name]['minima'])
+                print(f"      Модель {model_name}: {model_max} максимумов, {model_min} минимумов")
+    
+    # Создаем новый Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Все скважины"
+    
+    # Получаем список всех моделей (уникальные по всем скважинам)
+    all_models = set()
+    for df_well in well_dataframes.values():
+        all_models.update([m for m in df_well['model'].unique() if m != 'HISTORICAL'])
+    all_models = sorted(all_models)
+    
+    if not all_models:
+        print("    Предупреждение: нет модельных данных")
+        ws.append(["Нет модельных данных"])
+        wb.save(output_path)
+        return output_path
+    
+    print(f"  Найдено моделей: {all_models}")
+    print(f"  Всего скважин: {len(well_dataframes)}")
+    
+    # === СТРОКА 1: Заголовки таблицы ===
+    header_row1 = ['well', 'date', 'wbp_hist', 'wbp_hist_smoothed', 'wbp_hist_smoothed_max', 'wbp_hist_smoothed_min']
+    for model in all_models:
+        # Для каждой модели теперь 5 столбцов
+        header_row1.append(model)  # Название модели
+        header_row1.append("")      # Пустой столбец для wbp_model_max
+        header_row1.append("")      # Пустой столбец для wbp_model_min
+        header_row1.append("")      # Пустой столбец для wgpr_model
+        header_row1.append("")      # Пустой столбец для wgir_model
+    
+    ws.append(header_row1)
+    
+    # === СТРОКА 2: Подзаголовки параметров ===
+    header_row2 = ['', '', '', '', '', '']
+    for model in all_models:
+        header_row2.append('wbp_model')
+        header_row2.append('wbp_model_max')
+        header_row2.append('wbp_model_min')
+        header_row2.append('wgpr_model')
+        header_row2.append('wgir_model')
+    
+    ws.append(header_row2)
+    
+    # === СБОР ВСЕХ ДАННЫХ В ОДНУ ТАБЛИЦУ ===
+    total_rows = 0
+    
+    for well_idx, (well_name, df_well) in enumerate(well_dataframes.items()):
+        print(f"  Обработка скважины {well_name} ({well_idx+1}/{len(well_dataframes)})...")
+        
+        # Получаем уникальные даты для этой скважины (уже отсортированы)
+        well_dates = sorted(df_well['date'].unique())
+        
+        if not well_dates:
+            print(f"    Предупреждение: для скважины {well_name} нет данных по датам")
+            continue
+        
+        # Для каждой даты создаем строку данных
+        for date in well_dates:
+            # Преобразуем дату в строку (обрабатываем разные форматы дат)
+            try:
+                if isinstance(date, (pd.Timestamp, datetime)):
+                    date_str = date.strftime('%Y-%m-%d')
+                    date_key = date.strftime('%Y-%m-%d')  # Используем строку в формате YYYY-MM-DD для поиска
+                    date_ts = date  # Сохраняем timestamp для сравнения
+                elif isinstance(date, np.datetime64):
+                    # Преобразуем numpy.datetime64 в pandas.Timestamp
+                    date_ts = pd.Timestamp(date)
+                    date_str = date_ts.strftime('%Y-%m-%d')
+                    date_key = date_str  # Используем строку для поиска
+                else:
+                    # Пробуем преобразовать строку в datetime
+                    date_ts = pd.to_datetime(date)
+                    date_str = date_ts.strftime('%Y-%m-%d')
+                    date_key = date_str
+            except Exception as e:
+                print(f"    Ошибка преобразования даты {date}: {e}")
+                date_str = str(date)
+                date_key = str(date)
+                date_ts = None
+            
+            # Получаем историческое давление для этой даты
+            hist_pressure = None
+            hist_row = df_well[(df_well['date'] == date) & 
+                              (df_well['model'] == 'HISTORICAL') & 
+                              (df_well['parameter'] == 'pressure')]
+            if not hist_row.empty:
+                hist_pressure = hist_row['value'].iloc[0]
+            
+            # Получаем сглаженное историческое давление для этой даты
+            hist_smoothed = None
+            if well_name in smoothed_pressures:
+                # Пробуем найти точное совпадение даты
+                if date_key in smoothed_pressures[well_name]:
+                    hist_smoothed = smoothed_pressures[well_name][date_key]
+                else:
+                    # Пробуем найти совпадение по дате (без учета времени)
+                    for dict_date_key in smoothed_pressures[well_name].keys():
+                        try:
+                            # Преобразуем обе даты к одному формату для сравнения
+                            if isinstance(dict_date_key, str):
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            else:
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            
+                            if dict_date == date_key:
+                                hist_smoothed = smoothed_pressures[well_name][dict_date_key]
+                                break
+                        except:
+                            continue
+            
+            # Получаем максимумы и минимумы для сглаженных данных
+            hist_smoothed_max = None
+            hist_smoothed_min = None
+            
+            if well_name in extremes_data:
+                # Ищем максимум
+                if date_key in extremes_data[well_name]['maxima']:
+                    hist_smoothed_max = extremes_data[well_name]['maxima'][date_key]
+                else:
+                    # Пробуем найти совпадение по дате (без учета времени)
+                    for dict_date_key in extremes_data[well_name]['maxima'].keys():
+                        try:
+                            if isinstance(dict_date_key, str):
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            else:
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            
+                            if dict_date == date_key:
+                                hist_smoothed_max = extremes_data[well_name]['maxima'][dict_date_key]
+                                break
+                        except:
+                            continue
+                
+                # Ищем минимум
+                if date_key in extremes_data[well_name]['minima']:
+                    hist_smoothed_min = extremes_data[well_name]['minima'][date_key]
+                else:
+                    # Пробуем найти совпадение по дате (без учета времени)
+                    for dict_date_key in extremes_data[well_name]['minima'].keys():
+                        try:
+                            if isinstance(dict_date_key, str):
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            else:
+                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                            
+                            if dict_date == date_key:
+                                hist_smoothed_min = extremes_data[well_name]['minima'][dict_date_key]
+                                break
+                        except:
+                            continue
+            
+            # Создаем строку данных
+            data_row = [well_name, date_str, hist_pressure, hist_smoothed, hist_smoothed_max, hist_smoothed_min]
+            
+            # Добавляем модельные данные для каждой модели из общего списка
+            for model in all_models:
+                # Проверяем, есть ли данные для этой модели у текущей скважины
+                if model in df_well['model'].unique():
+                    # Давление (wbp)
+                    wbp_value = None
+                    wbp_row = df_well[(df_well['date'] == date) & 
+                                     (df_well['model'] == model) & 
+                                     (df_well['parameter'] == 'pressure')]
+                    if not wbp_row.empty:
+                        wbp_value = wbp_row['value'].iloc[0]
+                    
+                    # Максимумы и минимумы модельного давления
+                    wbp_model_max = None
+                    wbp_model_min = None
+                    
+                    if well_name in model_extremes and model in model_extremes[well_name]:
+                        # Ищем максимум для этой даты
+                        if date_key in model_extremes[well_name][model]['maxima']:
+                            wbp_model_max = model_extremes[well_name][model]['maxima'][date_key]
+                        else:
+                            # Пробуем найти совпадение по дате (без учета времени)
+                            for dict_date_key in model_extremes[well_name][model]['maxima'].keys():
+                                try:
+                                    # Преобразуем обе даты к одному формату для сравнения
+                                    if isinstance(dict_date_key, str):
+                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                                    else:
+                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                                    
+                                    if dict_date == date_key:
+                                        wbp_model_max = model_extremes[well_name][model]['maxima'][dict_date_key]
+                                        break
+                                except Exception as e:
+                                    continue
+                        
+                        # Ищем минимум для этой даты
+                        if date_key in model_extremes[well_name][model]['minima']:
+                            wbp_model_min = model_extremes[well_name][model]['minima'][date_key]
+                        else:
+                            # Пробуем найти совпадение по дате (без учета времени)
+                            for dict_date_key in model_extremes[well_name][model]['minima'].keys():
+                                try:
+                                    if isinstance(dict_date_key, str):
+                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                                    else:
+                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
+                                    
+                                    if dict_date == date_key:
+                                        wbp_model_min = model_extremes[well_name][model]['minima'][dict_date_key]
+                                        break
+                                except:
+                                    continue
+                    
+                    # Добыча газа (wgpr)
+                    wgpr_value = None
+                    wgpr_row = df_well[(df_well['date'] == date) & 
+                                      (df_well['model'] == model) & 
+                                      (df_well['parameter'] == 'gas_rate')]
+                    if not wgpr_row.empty:
+                        wgpr_value = wgpr_row['value'].iloc[0]
+                    
+                    # Закачка газа (wgir)
+                    wgir_value = None
+                    wgir_row = df_well[(df_well['date'] == date) & 
+                                      (df_well['model'] == model) & 
+                                      (df_well['parameter'] == 'gas_injection')]
+                    if not wgir_row.empty:
+                        wgir_value = wgir_row['value'].iloc[0]
+                else:
+                    # Если модель отсутствует для этой скважины, заполняем None
+                    wbp_value = None
+                    wbp_model_max = None
+                    wbp_model_min = None
+                    wgpr_value = None
+                    wgir_value = None
+                
+                data_row.extend([wbp_value, wbp_model_max, wbp_model_min, wgpr_value, wgir_value])
+            
+            # Добавляем строку в таблицу
+            ws.append(data_row)
+            total_rows += 1
+        
+        print(f"    ✓ Добавлено {len(well_dates)} строк для скважины {well_name}")
+    
+    # Автонастройка ширины столбцов
+    print("  Настройка ширины столбцов...")
+    for column in ws.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            if cell.value:
+                max_length = max(max_length, len(str(cell.value)))
+        adjusted_width = min(max_length + 2, 30)
+        ws.column_dimensions[column_letter].width = adjusted_width
+    
+    # Определяем последнюю колонку для фильтра
+    last_col = openpyxl.utils.get_column_letter(ws.max_column)
+    
+    # Добавляем фильтры и закрепляем заголовки
+    print("  Применение фильтров...")
+    ws.auto_filter.ref = f"A1:{last_col}2"  # Фильтр на первых двух строках заголовков
+    ws.freeze_panes = "A3"  # Закрепляем первые две строки заголовков
+    
+    # Добавляем информационную строку в начало
+    ws.insert_rows(1)
+    
+    info_cell = ws['A1']
+    info_cell.value = f"Сравнение моделей и фактических данных | Скважин: {len(well_dataframes)} | Строк данных: {total_rows} | Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    info_cell.font = Font(bold=True, color="FFFFFF")
+    info_cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    info_cell.alignment = Alignment(horizontal="center")
+    
+    # Объединяем ячейки информационной строки
+    ws.merge_cells(f'A1:{last_col}1')
+    
+    # Форматирование заголовков таблицы (строки 2 и 3)
+    # Строка 2: Основные заголовки
+    for cell in ws[2]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    
+    # Строка 3: Подзаголовки параметров
+    for cell in ws[3]:
+        if cell.column > 6:  # Начиная с 7-го столбца (после well, date, wbp_hist, wbp_hist_smoothed, wbp_hist_smoothed_max, wbp_hist_smoothed_min)
+            cell.font = Font(italic=True, bold=True)
+            cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    
+    # Добавляем условное форматирование
+    # Зеленый цвет для сглаженных значений (столбец D)
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    
+    # Красный цвет для максимумов сглаженных данных (столбец E)
+    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    
+    # Синий цвет для минимумов сглаженных данных (столбец F)
+    blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    
+    # Оранжевый цвет для максимумов модельных данных (столбцы: 8, 13, 18, ...)
+    orange_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    
+    # Фиолетовый цвет для минимумов модельных данных (столбцы: 9, 14, 19, ...)
+    purple_fill = PatternFill(start_color="E4DFEC", end_color="E4DFEC", fill_type="solid")
+    
+    # Применяем условное форматирование ко всем ячейкам в соответствующих столбцах
+    for row in range(4, ws.max_row + 1):
+        # Сглаженные значения (столбец D)
+        cell_d = ws[f'D{row}']
+        if cell_d.value is not None:
+            cell_d.fill = green_fill
+        
+        # Максимумы сглаженных данных (столбец E)
+        cell_e = ws[f'E{row}']
+        if cell_e.value is not None:
+            cell_e.fill = red_fill
+        
+        # Минимумы сглаженных данных (столбец F)
+        cell_f = ws[f'F{row}']
+        if cell_f.value is not None:
+            cell_f.fill = blue_fill
+        
+        # Максимумы и минимумы модельных данных (для каждой модели)
+        # Первая модель начинается с колонки G (7) - wbp_model, H (8) - wbp_model_max, I (9) - wbp_model_min
+        model_col_start = 7
+        for model_idx in range(len(all_models)):
+            # Максимумы модельных данных (второй столбец для каждой модели)
+            max_col = model_col_start + model_idx * 5 + 1  # +1 потому что первый столбец модели (wbp_model) имеет индекс 0
+            if max_col <= ws.max_column:
+                max_cell = ws[f'{openpyxl.utils.get_column_letter(max_col)}{row}']
+                if max_cell.value is not None:
+                    max_cell.fill = orange_fill
+            
+            # Минимумы модельных данных (третий столбец для каждой модели)
+            min_col = model_col_start + model_idx * 5 + 2  # +2 потому что третий столбец модели - wbp_model_min
+            if min_col <= ws.max_column:
+                min_cell = ws[f'{openpyxl.utils.get_column_letter(min_col)}{row}']
+                if min_cell.value is not None:
+                    min_cell.fill = purple_fill
+    
+    # Сохраняем файл
+    try:
+        wb.save(output_path)
+        print(f"\n✓ Файл успешно сохранен: {output_path}")
+        print(f"  Структура таблицы:")
+        print(f"    - Лист: '{ws.title}'")
+        print(f"    - Скважин: {len(well_dataframes)}")
+        print(f"    - Моделей: {len(all_models)}")
+        print(f"    - Столбцов: {ws.max_column}")
+        print(f"    - Всего строк данных: {total_rows}")
+        print(f"    - Фильтры: строки 2-3")
+        print(f"    - Закреплено: строки 1-3")
+        
+        # Выводим структуру столбцов
+        print(f"\n  Структура столбцов:")
+        print(f"    1. well - имя скважины")
+        print(f"    2. date - дата")
+        print(f"    3. wbp_hist - историческое давление")
+        print(f"    4. wbp_hist_smoothed - сглаженное историческое давление (зеленый фон)")
+        print(f"    5. wbp_hist_smoothed_max - максимумы сглаженного давления (красный фон)")
+        print(f"    6. wbp_hist_smoothed_min - минимумы сглаженного давления (синий фон)")
+        col_idx = 7
+        for i, model in enumerate(all_models):
+            print(f"    {col_idx}. {model}_wbp - давление модели {model}")
+            print(f"    {col_idx+1}. {model}_wbp_max - максимумы давления модели {model} (оранжевый фон)")
+            print(f"    {col_idx+2}. {model}_wbp_min - минимумы давления модели {model} (фиолетовый фон)")
+            print(f"    {col_idx+3}. {model}_wgpr - добыча газа модели {model}")
+            print(f"    {col_idx+4}. {model}_wgir - закачка газа модели {model}")
+            col_idx += 5
+        
+        # Проверяем, есть ли экстремумы в файле - более детальная проверка
+        print(f"\n  Проверка экстремумов в файле:")
+        smoothed_maxima_count = 0
+        smoothed_minima_count = 0
+        model_maxima_count = 0
+        model_minima_count = 0
+        
+        for row in range(4, min(ws.max_row + 1, 200)):  # Проверяем первые 200 строк данных
+            # Сглаженные экстремумы
+            smoothed_max_cell = ws[f'E{row}']
+            smoothed_min_cell = ws[f'F{row}']
+            
+            if smoothed_max_cell.value is not None:
+                smoothed_maxima_count += 1
+                if smoothed_maxima_count <= 3:  # Выводим первые 3 максимума
+                    well_name = ws[f'A{row}'].value
+                    date_val = ws[f'B{row}'].value
+                    print(f"    Сглаженный максимум строка {row}: {well_name}, {date_val} -> {smoothed_max_cell.value:.2f}")
+            
+            if smoothed_min_cell.value is not None:
+                smoothed_minima_count += 1
+                if smoothed_minima_count <= 3:  # Выводим первые 3 минимума
+                    well_name = ws[f'A{row}'].value
+                    date_val = ws[f'B{row}'].value
+                    print(f"    Сглаженный минимум строка {row}: {well_name}, {date_val} -> {smoothed_min_cell.value:.2f}")
+            
+            # Модельные экстремумы
+            for model_idx in range(len(all_models)):
+                max_col = 7 + model_idx * 5 + 1  # Столбец с максимумами модели
+                min_col = 7 + model_idx * 5 + 2  # Столбец с минимумами модели
+                
+                if max_col <= ws.max_column:
+                    model_max_cell = ws[f'{openpyxl.utils.get_column_letter(max_col)}{row}']
+                    if model_max_cell.value is not None:
+                        model_maxima_count += 1
+                        if model_maxima_count <= 5:  # Выводим первые 5 максимумов моделей
+                            well_name = ws[f'A{row}'].value
+                            date_val = ws[f'B{row}'].value
+                            model_name = all_models[model_idx]
+                            print(f"    Максимум модели {model_name} строка {row}: {well_name}, {date_val} -> {model_max_cell.value:.2f}")
+                
+                if min_col <= ws.max_column:
+                    model_min_cell = ws[f'{openpyxl.utils.get_column_letter(min_col)}{row}']
+                    if model_min_cell.value is not None:
+                        model_minima_count += 1
+                        if model_minima_count <= 5:  # Выводим первые 5 минимумов моделей
+                            well_name = ws[f'A{row}'].value
+                            date_val = ws[f'B{row}'].value
+                            model_name = all_models[model_idx]
+                            print(f"    Минимум модели {model_name} строка {row}: {well_name}, {date_val} -> {model_min_cell.value:.2f}")
+        
+        print(f"\n    Сводная статистика по экстремумам:")
+        print(f"    Всего сглаженных максимумов в первых {min(ws.max_row - 3, 200)} строках: {smoothed_maxima_count}")
+        print(f"    Всего сглаженных минимумов в первых {min(ws.max_row - 3, 200)} строках: {smoothed_minima_count}")
+        print(f"    Всего модельных максимумов в первых {min(ws.max_row - 3, 200)} строках: {model_maxima_count}")
+        print(f"    Всего модельных минимумов в первых {min(ws.max_row - 3, 200)} строках: {model_minima_count}")
+        
+    except Exception as e:
+        print(f"✗ Ошибка при сохранении файла: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return output_path
+
+def main():
+    """
+    Основная функция для получения унифицированных данных
+    """
+    print("=" * 80)
+    print("ПОЛУЧЕНИЕ УНИФИЦИРОВАННЫХ ДАННЫХ ДЛЯ СРАВНЕНИЯ")
+    print("=" * 80)
+    
+    try:
+        # 1. Читаем фактические данные из файла
+        print(f"\n1. Чтение фактических данных из файла: {WBP_FACT_TXT}")
+        fact_file_path = os.path.join(PROJECT_FOLDER_PATH, WBP_FACT_TXT)
+        
+        if not os.path.exists(fact_file_path):
+            print(f"ОШИБКА: Файл {fact_file_path} не найден!")
+            print(f"Текущая директория проекта: {PROJECT_FOLDER_PATH}")
+            return None
+        
+        df_fact = parse_fact_well_data(fact_file_path)
+        
+        if df_fact.empty:
+            print("ОШИБКА: Не удалось загрузить фактические данные!")
+            return None
+        
+        print(f"Загружено {len(df_fact)} записей фактических данных")
+        print(f"Уникальных скважин: {df_fact['well_fact'].nunique()}")
+        
+        # 2. Получаем унифицированные данные БЕЗ интерполяции
+        print(f"\n2. Получение унифицированных данных (без интерполяции)...")
+        well_dataframes, models_raw = get_unified_data_per_well_without_interpolation(
+            model_names=MODEL_NAMES,
+            historical_df=df_fact,
+            well_column='well_fact',
+            date_column='date_fact',
+            pressure_column='wpb_bar_fact'
+        )
+        
+        if not well_dataframes:
+            print("Ошибка: не удалось получить унифицированные данные!")
+            return None
+        
+        # 3. Выводим статистику
+        print("\n" + "=" * 60)
+        print("РЕЗУЛЬТАТЫ")
+        print("=" * 60)
+        
+        total_records = 0
+        param_counts = {}
+        model_counts = {}
+        
+        for well, df_well in well_dataframes.items():
+            records = len(df_well)
+            total_records += records
+            
+            # Считаем параметры
+            for param in df_well['parameter'].unique():
+                if param not in param_counts:
+                    param_counts[param] = 0
+                param_counts[param] += len(df_well[df_well['parameter'] == param])
+            
+            # Считаем модели
+            for model in df_well['model'].unique():
+                if model not in model_counts:
+                    model_counts[model] = 0
+                model_counts[model] += len(df_well[df_well['model'] == model])
+            
+            fact_dates = df_well[df_well['model'] == 'HISTORICAL']['date'].nunique()
+            model_dates = df_well[df_well['model'] != 'HISTORICAL']['date'].nunique()
+            
+            print(f"Скважина {well}: {records} записей, "
+                  f"{df_well['parameter'].nunique()} параметров, "
+                  f"дат: {fact_dates} факт + {model_dates} модель")
+        
+        print(f"\nВсего записей: {total_records}")
+        print(f"Всего скважин: {len(well_dataframes)}")
+        print(f"Распределение по параметрам:")
+        for param, count in param_counts.items():
+            print(f"  {param}: {count} записей")
+        
+        print(f"\nРаспределение по источникам данных:")
+        for model, count in model_counts.items():
+            print(f"  {model}: {count} записей")
+        
+        # 4. Сохраняем данные в Excel с указанной структурой
+        print(f"\n3. Сохранение данных в Excel файл...")
+        output_excel = os.path.join(PROJECT_FOLDER_PATH, "structured_comparison_no_interpolation.xlsx")
+        save_to_excel_structured_single_sheet(well_dataframes, df_fact, models_raw, output_excel)
+        
+        # Возвращаем данные для дальнейшего использования
+        return {
+            'fact_data': df_fact,
+            'well_dataframes': well_dataframes,
+            'models_raw': models_raw,
+            'excel_file': output_excel,
+            'statistics': {
+                'total_records': total_records,
+                'total_wells': len(well_dataframes),
+                'parameter_counts': param_counts,
+                'model_counts': model_counts
+            }
+        }
+        
+    except Exception as e:
+        print(f"\nОШИБКА ВО ВРЕМЯ ВЫПОЛНЕНИЯ: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+# БЛОК ВЫПОЛНЕНИЯ СКРИПТА
+result_data = main()
+if result_data:
+    print("\n" + "=" * 80)
+    print("ДАННЫЕ УСПЕШНО ПОДГОТОВЛЕНЫ ДЛЯ СРАВНЕНИЯ!")
+    print("=" * 80)
+    print(f"Структура данных содержит:")
+    print(f"  - Фактические данные: {len(result_data['fact_data'])} записей")
+    print(f"  - Данные по скважинам: {len(result_data['well_dataframes'])} скважин")
+    print(f"  - Сырые модельные данные: {len(result_data['models_raw'])} моделей")
+    print(f"  - Всего записей: {result_data['statistics']['total_records']}")
+    print(f"  - Параметры: {list(result_data['statistics']['parameter_counts'].keys())}")
+    print(f"  - Excel файл: {result_data['excel_file']}")
+    
+    # Пример доступа к данным
+    if result_data['well_dataframes']:
+        first_well = list(result_data['well_dataframes'].keys())[0]
+        df_first_well = result_data['well_dataframes'][first_well]
+        print(f"\nПример данных для скважины {first_well}:")
+        print(f"  Всего записей: {len(df_first_well)}")
+        print(f"  Уникальные даты: {df_first_well['date'].nunique()}")
+        print(f"  Модели: {df_first_well['model'].unique().tolist()}")
+        print(f"  Параметры: {df_first_well['parameter'].unique().tolist()}")
+        
+        # Выводим первые 10 строк
+        print(f"\nПервые 10 строк данных:")
+        print(df_first_well.head(10))
