@@ -1638,185 +1638,143 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
     
     ws.append(header_row2)
     
-    # === СБОР ВСЕХ ДАННЫХ В ОДНУ ТАБЛИЦУ ===
-    total_rows = 0
+    # === ПРЕДВАРИТЕЛЬНАЯ ИНДЕКСАЦИЯ ДАННЫХ ДЛЯ БЫСТРОГО ДОСТУПА ===
+    # Создаем индексы для быстрого поиска данных по скважинам, датам и моделям
+    well_data_indexed: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
     
-    for well_idx, (well_name, df_well) in enumerate(well_dataframes.items()):
-        # Получаем уникальные даты для этой скважины (уже отсортированы)
+    for well_name, df_well in well_dataframes.items():
+        well_data_indexed[well_name] = {
+            'models': set(df_well['model'].unique()),
+            'by_date_model_param': {}
+        }
+        
+        # Индексируем данные по (date, model, parameter) -> value
+        for _, row in df_well.iterrows():
+            date = row['date']
+            model = row['model']
+            param = row['parameter']
+            value = row['value']
+            
+            # Нормализуем дату в строку YYYY-MM-DD
+            try:
+                if isinstance(date, (pd.Timestamp, datetime)):
+                    date_key = date.strftime('%Y-%m-%d')
+                elif isinstance(date, np.datetime64):
+                    date_key = pd.Timestamp(date).strftime('%Y-%m-%d')
+                else:
+                    date_key = pd.to_datetime(date).strftime('%Y-%m-%d')
+            except Exception:
+                date_key = str(date)
+            
+            key = (date_key, model, param)
+            if key not in well_data_indexed[well_name]['by_date_model_param']:
+                well_data_indexed[well_name]['by_date_model_param'][key] = value
+    
+    # Нормализуем ключи дат в словарях экстремумов
+    def normalize_extremes_dict(extremes_dict: Dict[str, float]) -> Dict[str, float]:
+        """Нормализует ключи дат в словаре экстремумов"""
+        normalized = {}
+        for date_key, value in extremes_dict.items():
+            try:
+                if isinstance(date_key, str):
+                    norm_key = pd.to_datetime(date_key).strftime('%Y-%m-%d')
+                else:
+                    norm_key = pd.to_datetime(date_key).strftime('%Y-%m-%d')
+                normalized[norm_key] = value
+            except Exception:
+                normalized[str(date_key)] = value
+        return normalized
+    
+    # Нормализуем экстремумы для факта
+    normalized_extremes_data: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for well_name, well_extremes in extremes_data.items():
+        normalized_extremes_data[well_name] = {
+            'maxima': normalize_extremes_dict(well_extremes.get('maxima', {})),
+            'minima': normalize_extremes_dict(well_extremes.get('minima', {}))
+        }
+    
+    # Нормализуем экстремумы для моделей
+    normalized_model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+    for well_name, well_models in model_extremes.items():
+        normalized_model_extremes[well_name] = {}
+        for model_name, model_extremes_dict in well_models.items():
+            normalized_model_extremes[well_name][model_name] = {
+                'maxima': normalize_extremes_dict(model_extremes_dict.get('maxima', {})),
+                'minima': normalize_extremes_dict(model_extremes_dict.get('minima', {}))
+            }
+    
+    # Нормализуем сглаженные давления
+    normalized_smoothed_pressures: Dict[str, Dict[str, float]] = {}
+    for well_name, well_smoothed in smoothed_pressures.items():
+        normalized_smoothed_pressures[well_name] = normalize_extremes_dict(well_smoothed)
+    
+    # === СБОР ВСЕХ ДАННЫХ В ОДНУ ТАБЛИЦУ (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ) ===
+    all_rows: List[List[Any]] = []
+    
+    for well_name, df_well in well_dataframes.items():
+        # Получаем уникальные даты для этой скважины
         well_dates = sorted(df_well['date'].unique())
         
         if not well_dates:
             continue
         
+        well_indexed = well_data_indexed[well_name]
+        well_models = well_indexed['models']
+        
         # Для каждой даты создаем строку данных
         for date in well_dates:
-            # Преобразуем дату в строку (обрабатываем разные форматы дат)
+            # Нормализуем дату
             try:
                 if isinstance(date, (pd.Timestamp, datetime)):
-                    date_str = date.strftime('%Y-%m-%d')
-                    date_key = date.strftime('%Y-%m-%d')  # Используем строку в формате YYYY-MM-DD для поиска
-                    date_ts = date  # Сохраняем timestamp для сравнения
+                    date_key = date.strftime('%Y-%m-%d')
+                    date_str = date_key
                 elif isinstance(date, np.datetime64):
-                    # Преобразуем numpy.datetime64 в pandas.Timestamp
                     date_ts = pd.Timestamp(date)
-                    date_str = date_ts.strftime('%Y-%m-%d')
-                    date_key = date_str  # Используем строку для поиска
+                    date_key = date_ts.strftime('%Y-%m-%d')
+                    date_str = date_key
                 else:
-                    # Пробуем преобразовать строку в datetime
                     date_ts = pd.to_datetime(date)
-                    date_str = date_ts.strftime('%Y-%m-%d')
-                    date_key = date_str
-            except Exception as e:
-                print(f"    Ошибка преобразования даты {date}: {e}")
-                date_str = str(date)
+                    date_key = date_ts.strftime('%Y-%m-%d')
+                    date_str = date_key
+            except Exception:
                 date_key = str(date)
-                date_ts = None
+                date_str = date_key
             
-            # Получаем историческое давление для этой даты
-            hist_pressure = None
-            hist_row = df_well[(df_well['date'] == date) & 
-                              (df_well['model'] == 'HISTORICAL') & 
-                              (df_well['parameter'] == 'pressure')]
-            if not hist_row.empty:
-                hist_pressure = hist_row['value'].iloc[0]
+            # Получаем историческое давление (быстрый доступ через индекс)
+            hist_pressure = well_indexed['by_date_model_param'].get(
+                (date_key, 'HISTORICAL', 'pressure'), None
+            )
             
-            # Получаем сглаженное историческое давление для этой даты
-            hist_smoothed = None
-            if well_name in smoothed_pressures:
-                # Пробуем найти точное совпадение даты
-                if date_key in smoothed_pressures[well_name]:
-                    hist_smoothed = smoothed_pressures[well_name][date_key]
-                else:
-                    # Пробуем найти совпадение по дате (без учета времени)
-                    for dict_date_key in smoothed_pressures[well_name].keys():
-                        try:
-                            # Преобразуем обе даты к одному формату для сравнения
-                            if isinstance(dict_date_key, str):
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            else:
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            
-                            if dict_date == date_key:
-                                hist_smoothed = smoothed_pressures[well_name][dict_date_key]
-                                break
-                        except Exception:
-                            continue
+            # Получаем сглаженное историческое давление
+            hist_smoothed = normalized_smoothed_pressures.get(well_name, {}).get(date_key, None)
             
             # Получаем максимумы и минимумы для сглаженных данных
-            hist_smoothed_max = None
-            hist_smoothed_min = None
-            
-            if well_name in extremes_data:
-                # Ищем максимум
-                if date_key in extremes_data[well_name]['maxima']:
-                    hist_smoothed_max = extremes_data[well_name]['maxima'][date_key]
-                else:
-                    # Пробуем найти совпадение по дате (без учета времени)
-                    for dict_date_key in extremes_data[well_name]['maxima'].keys():
-                        try:
-                            if isinstance(dict_date_key, str):
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            else:
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            
-                            if dict_date == date_key:
-                                hist_smoothed_max = extremes_data[well_name]['maxima'][dict_date_key]
-                                break
-                        except Exception:
-                            continue
-                
-                # Ищем минимум
-                if date_key in extremes_data[well_name]['minima']:
-                    hist_smoothed_min = extremes_data[well_name]['minima'][date_key]
-                else:
-                    # Пробуем найти совпадение по дате (без учета времени)
-                    for dict_date_key in extremes_data[well_name]['minima'].keys():
-                        try:
-                            if isinstance(dict_date_key, str):
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            else:
-                                dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                            
-                            if dict_date == date_key:
-                                hist_smoothed_min = extremes_data[well_name]['minima'][dict_date_key]
-                                break
-                        except Exception:
-                            continue
+            well_extremes = normalized_extremes_data.get(well_name, {})
+            hist_smoothed_max = well_extremes.get('maxima', {}).get(date_key, None)
+            hist_smoothed_min = well_extremes.get('minima', {}).get(date_key, None)
             
             # Создаем строку данных
             data_row = [well_name, date_str, hist_pressure, hist_smoothed, hist_smoothed_max, hist_smoothed_min]
             
-            # Добавляем модельные данные для каждой модели из общего списка
+            # Добавляем модельные данные для каждой модели
             for model in all_models:
-                # Проверяем, есть ли данные для этой модели у текущей скважины
-                if model in df_well['model'].unique():
-                    # Давление (wbp)
-                    wbp_value = None
-                    wbp_row = df_well[(df_well['date'] == date) & 
-                                     (df_well['model'] == model) & 
-                                     (df_well['parameter'] == 'pressure')]
-                    if not wbp_row.empty:
-                        wbp_value = wbp_row['value'].iloc[0]
+                if model in well_models:
+                    # Быстрый доступ через индекс
+                    wbp_value = well_indexed['by_date_model_param'].get(
+                        (date_key, model, 'pressure'), None
+                    )
+                    wgpr_value = well_indexed['by_date_model_param'].get(
+                        (date_key, model, 'gas_rate'), None
+                    )
+                    wgir_value = well_indexed['by_date_model_param'].get(
+                        (date_key, model, 'gas_injection'), None
+                    )
                     
                     # Максимумы и минимумы модельного давления
-                    wbp_model_max = None
-                    wbp_model_min = None
-                    
-                    if well_name in model_extremes and model in model_extremes[well_name]:
-                        # Ищем максимум для этой даты
-                        if date_key in model_extremes[well_name][model]['maxima']:
-                            wbp_model_max = model_extremes[well_name][model]['maxima'][date_key]
-                        else:
-                            # Пробуем найти совпадение по дате (без учета времени)
-                            for dict_date_key in model_extremes[well_name][model]['maxima'].keys():
-                                try:
-                                    # Преобразуем обе даты к одному формату для сравнения
-                                    if isinstance(dict_date_key, str):
-                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                                    else:
-                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                                    
-                                    if dict_date == date_key:
-                                        wbp_model_max = model_extremes[well_name][model]['maxima'][dict_date_key]
-                                        break
-                                except Exception:
-                                    continue
-                        
-                        # Ищем минимум для этой даты
-                        if date_key in model_extremes[well_name][model]['minima']:
-                            wbp_model_min = model_extremes[well_name][model]['minima'][date_key]
-                        else:
-                            # Пробуем найти совпадение по дате (без учета времени)
-                            for dict_date_key in model_extremes[well_name][model]['minima'].keys():
-                                try:
-                                    if isinstance(dict_date_key, str):
-                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                                    else:
-                                        dict_date = pd.to_datetime(dict_date_key).strftime('%Y-%m-%d')
-                                    
-                                    if dict_date == date_key:
-                                        wbp_model_min = model_extremes[well_name][model]['minima'][dict_date_key]
-                                        break
-                                except Exception:
-                                    continue
-                    
-                    # Добыча газа (wgpr)
-                    wgpr_value = None
-                    wgpr_row = df_well[(df_well['date'] == date) & 
-                                      (df_well['model'] == model) & 
-                                      (df_well['parameter'] == 'gas_rate')]
-                    if not wgpr_row.empty:
-                        wgpr_value = wgpr_row['value'].iloc[0]
-                    
-                    # Закачка газа (wgir)
-                    wgir_value = None
-                    wgir_row = df_well[(df_well['date'] == date) & 
-                                      (df_well['model'] == model) & 
-                                      (df_well['parameter'] == 'gas_injection')]
-                    if not wgir_row.empty:
-                        wgir_value = wgir_row['value'].iloc[0]
+                    model_extremes_dict = normalized_model_extremes.get(well_name, {}).get(model, {})
+                    wbp_model_max = model_extremes_dict.get('maxima', {}).get(date_key, None)
+                    wbp_model_min = model_extremes_dict.get('minima', {}).get(date_key, None)
                 else:
-                    # Если модель отсутствует для этой скважины, заполняем None
                     wbp_value = None
                     wbp_model_max = None
                     wbp_model_min = None
@@ -1825,9 +1783,14 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
                 
                 data_row.extend([wbp_value, wbp_model_max, wbp_model_min, wgpr_value, wgir_value])
             
-            # Добавляем строку в таблицу
-            ws.append(data_row)
-            total_rows += 1
+            all_rows.append(data_row)
+    
+    # Добавляем все строки пакетом (значительно быстрее)
+    print(f"  Добавление {len(all_rows)} строк данных...")
+    for row in all_rows:
+        ws.append(row)
+    
+    total_rows = len(all_rows)
     
     # Сохраняем файл (без форматирования для ускорения)
     try:
