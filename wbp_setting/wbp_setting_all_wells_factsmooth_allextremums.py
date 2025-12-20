@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import warnings
+import json
+import http.client
 from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
@@ -39,6 +41,12 @@ MODEL_MIN_DISTANCE_DAYS: int = 45  # Минимальное расстояние
 MODEL_PROMINENCE_PERCENT: float = 1.0  # Минимальная значимость экстремума в процентах для моделей (более чувствительно)
 MODEL_MAX_CYCLE_DAYS: int = 400  # Максимальная длина цикла в днях для моделей
 MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях для моделей
+
+# Настройки сервера для построения графиков
+GRAPH_SERVER_HOST: str = "localhost"  # Хост сервера
+GRAPH_SERVER_PORT: int = 8000  # Порт сервера
+GRAPH_SERVER_ENDPOINT: str = "/api/generate_graphs"  # Эндпойнт для запроса графиков
+GRAPH_ARCHIVE_NAME: str = "graphs_archive.zip"  # Имя архива с графиками для сохранения
 
 PROJECT_FOLDER_PATH: str = get_project_folder()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ПУТЬ К ПРОЕКТУ (пример - I:/L/phg/RedGift_USG)
 
@@ -1956,8 +1964,8 @@ def save_to_excel_with_all_sheets(
     
     Returns
     -------
-    str
-        Путь к сохраненному файлу
+    Tuple[str, Dict[str, Dict[str, Dict[str, float]]], Dict[str, Dict[str, Dict[str, Dict[str, float]]]]]
+        (путь к файлу, extremes_data, model_extremes)
     """
     print(f"\nСохранение данных в Excel файл: {output_path}")
     
@@ -1982,7 +1990,291 @@ def save_to_excel_with_all_sheets(
         import traceback
         traceback.print_exc()
     
-    return output_path
+    return output_path, extremes_data, model_extremes
+
+
+def prepare_graph_data(
+    well_dataframes: Dict[str, pd.DataFrame],
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]],
+    num_extremes: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Подготавливает данные для отправки на сервер построения графиков.
+    
+    Parameters
+    ----------
+    well_dataframes : Dict[str, pd.DataFrame]
+        DataFrame по скважинам с данными о датах и давлениях
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей
+    num_extremes : int
+        Количество последних экстремумов для включения (по умолчанию 5)
+    
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Список словарей с данными для каждой скважины в формате для сервера
+    """
+    result: List[Dict[str, Any]] = []
+    
+    # Получаем все скважины
+    all_wells: set = set(well_dataframes.keys())
+    all_wells.update(extremes_data.keys())
+    all_wells.update(model_extremes.keys())
+    
+    for well_name in all_wells:
+        well_data: Dict[str, Any] = {'well_name': well_name}
+        
+        # Подготавливаем данные для факта
+        if well_name in well_dataframes:
+            df_well = well_dataframes[well_name]
+            
+            # Получаем фактические данные (HISTORICAL)
+            fact_data_df = df_well[
+                (df_well['model'] == 'HISTORICAL') &
+                (df_well['parameter'] == 'pressure')
+            ].copy()
+            
+            if not fact_data_df.empty:
+                # Сортируем по дате
+                fact_data_df = fact_data_df.sort_values('date')
+                
+                # Извлекаем даты и давления
+                dates: List[str] = []
+                wbp: List[float] = []
+                
+                for _, row in fact_data_df.iterrows():
+                    date = row['date']
+                    value = row['value']
+                    
+                    # Преобразуем дату в строку
+                    if isinstance(date, (pd.Timestamp, datetime)):
+                        date_str = date.strftime('%Y-%m-%d')
+                    elif isinstance(date, np.datetime64):
+                        date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
+                    else:
+                        try:
+                            date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+                        except Exception:
+                            date_str = str(date)
+                    
+                    if pd.notna(value):
+                        dates.append(date_str)
+                        wbp.append(float(value))
+                
+                well_data['fact'] = {
+                    'dates': dates,
+                    'wbp': wbp,
+                    'extremums': []
+                }
+                
+                # Добавляем экстремумы для факта
+                if well_name in extremes_data:
+                    fact_extremes = extremes_data[well_name]
+                    
+                    # Максимумы
+                    fact_maxima = fact_extremes.get('maxima', {})
+                    if fact_maxima:
+                        sorted_maxima = sorted(
+                            [(date, value) for date, value in fact_maxima.items()],
+                            key=lambda x: x[0],
+                            reverse=True
+                        )[:num_extremes]
+                        
+                        for date_str, value in sorted_maxima:
+                            well_data['fact']['extremums'].append({
+                                'date': date_str,
+                                'wbp': value,
+                                'type': 'max'
+                            })
+                    
+                    # Минимумы
+                    fact_minima = fact_extremes.get('minima', {})
+                    if fact_minima:
+                        sorted_minima = sorted(
+                            [(date, value) for date, value in fact_minima.items()],
+                            key=lambda x: x[0],
+                            reverse=True
+                        )[:num_extremes]
+                        
+                        for date_str, value in sorted_minima:
+                            well_data['fact']['extremums'].append({
+                                'date': date_str,
+                                'wbp': value,
+                                'type': 'min'
+                            })
+        
+        # Подготавливаем данные для моделей
+        if well_name in model_extremes and well_name in well_dataframes:
+            df_well = well_dataframes[well_name]
+            
+            for model_name, model_extreme_data in model_extremes[well_name].items():
+                # Получаем данные модели
+                model_data_df = df_well[
+                    (df_well['model'] == model_name) &
+                    (df_well['parameter'] == 'pressure')
+                ].copy()
+                
+                if not model_data_df.empty:
+                    # Сортируем по дате
+                    model_data_df = model_data_df.sort_values('date')
+                    
+                    # Извлекаем даты и давления
+                    dates: List[str] = []
+                    wbp: List[float] = []
+                    
+                    for _, row in model_data_df.iterrows():
+                        date = row['date']
+                        value = row['value']
+                        
+                        # Преобразуем дату в строку
+                        if isinstance(date, (pd.Timestamp, datetime)):
+                            date_str = date.strftime('%Y-%m-%d')
+                        elif isinstance(date, np.datetime64):
+                            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
+                        else:
+                            try:
+                                date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
+                            except Exception:
+                                date_str = str(date)
+                        
+                        if pd.notna(value):
+                            dates.append(date_str)
+                            wbp.append(float(value))
+                    
+                    well_data[model_name] = {
+                        'dates': dates,
+                        'wbp': wbp,
+                        'extremums': []
+                    }
+                    
+                    # Добавляем экстремумы для модели
+                    model_maxima = model_extreme_data.get('maxima', {})
+                    if model_maxima:
+                        sorted_maxima = sorted(
+                            [(date, value) for date, value in model_maxima.items()],
+                            key=lambda x: x[0],
+                            reverse=True
+                        )[:num_extremes]
+                        
+                        for date_str, value in sorted_maxima:
+                            well_data[model_name]['extremums'].append({
+                                'date': date_str,
+                                'wbp': value,
+                                'type': 'max'
+                            })
+                    
+                    model_minima = model_extreme_data.get('minima', {})
+                    if model_minima:
+                        sorted_minima = sorted(
+                            [(date, value) for date, value in model_minima.items()],
+                            key=lambda x: x[0],
+                            reverse=True
+                        )[:num_extremes]
+                        
+                        for date_str, value in sorted_minima:
+                            well_data[model_name]['extremums'].append({
+                                'date': date_str,
+                                'wbp': value,
+                                'type': 'min'
+                            })
+        
+        result.append(well_data)
+    
+    return result
+
+
+def send_graph_request_and_save_archive(
+    well_dataframes: Dict[str, pd.DataFrame],
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+) -> Optional[str]:
+    """
+    Отправляет данные на сервер для построения графиков и сохраняет полученный архив.
+    
+    Parameters
+    ----------
+    well_dataframes : Dict[str, pd.DataFrame]
+        DataFrame по скважинам
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей
+    
+    Returns
+    -------
+    Optional[str]
+        Путь к сохраненному архиву или None в случае ошибки
+    """
+    print(f"\nОтправка данных на сервер для построения графиков...")
+    print(f"  Хост: {GRAPH_SERVER_HOST}:{GRAPH_SERVER_PORT}")
+    print(f"  Эндпойнт: {GRAPH_SERVER_ENDPOINT}")
+    
+    try:
+        # Подготавливаем данные
+        print("  Подготовка данных...")
+        graph_data = prepare_graph_data(well_dataframes, extremes_data, model_extremes, num_extremes=5)
+        
+        if not graph_data:
+            print("  Предупреждение: нет данных для отправки")
+            return None
+        
+        print(f"  Подготовлено данных для {len(graph_data)} скважин")
+        
+        # Формируем JSON
+        json_data = json.dumps(graph_data, ensure_ascii=False, indent=2)
+        
+        # Создаем соединение
+        conn = http.client.HTTPConnection(GRAPH_SERVER_HOST, GRAPH_SERVER_PORT)
+        
+        # Устанавливаем заголовки
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': str(len(json_data.encode('utf-8')))
+        }
+        
+        # Отправляем POST запрос
+        print("  Отправка запроса на сервер...")
+        conn.request('POST', GRAPH_SERVER_ENDPOINT, json_data, headers)
+        
+        # Получаем ответ
+        response = conn.getresponse()
+        
+        if response.status != 200:
+            print(f"  ✗ Ошибка: сервер вернул статус {response.status}")
+            print(f"  Сообщение: {response.read().decode('utf-8')}")
+            conn.close()
+            return None
+        
+        # Читаем архив из ответа
+        print("  Получение архива с сервера...")
+        archive_data = response.read()
+        
+        conn.close()
+        
+        # Сохраняем архив
+        archive_path = os.path.join(PROJECT_FOLDER_PATH, GRAPH_ARCHIVE_NAME)
+        print(f"  Сохранение архива: {archive_path}")
+        
+        with open(archive_path, 'wb') as f:
+            f.write(archive_data)
+        
+        print(f"  ✓ Архив успешно сохранен: {archive_path}")
+        print(f"  Размер архива: {len(archive_data)} байт")
+        
+        return archive_path
+        
+    except http.client.HTTPException as e:
+        print(f"  ✗ Ошибка HTTP соединения: {e}")
+        return None
+    except Exception as e:
+        print(f"  ✗ Ошибка при отправке запроса: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def main() -> Optional[Dict[str, Any]]:
@@ -2056,10 +2348,17 @@ def main() -> Optional[Dict[str, Any]]:
         output_excel: str = os.path.join(
             PROJECT_FOLDER_PATH, "structured_comparison_no_interpolation.xlsx"
         )
-        save_to_excel_with_all_sheets(well_dataframes, df_fact, models_raw, output_excel)
+        output_excel, extremes_data, model_extremes = save_to_excel_with_all_sheets(
+            well_dataframes, df_fact, models_raw, output_excel
+        )
+        
+        # 5. Отправляем данные на сервер для построения графиков
+        archive_path = send_graph_request_and_save_archive(
+            well_dataframes, extremes_data, model_extremes
+        )
         
         # Возвращаем данные для дальнейшего использования
-        return {
+        result = {
             'fact_data': df_fact,
             'well_dataframes': well_dataframes,
             'models_raw': models_raw,
@@ -2071,6 +2370,11 @@ def main() -> Optional[Dict[str, Any]]:
                 'model_counts': model_counts
             }
         }
+        
+        if archive_path:
+            result['graph_archive'] = archive_path
+        
+        return result
         
     except Exception as e:
         print(f"\nОШИБКА ВО ВРЕМЯ ВЫПОЛНЕНИЯ: {str(e)}")
