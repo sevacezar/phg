@@ -16,7 +16,7 @@ from openpyxl.formatting.rule import ColorScaleRule
 
 
 # БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
-WBP_FACT_TXT: str = "scripts_data/Pfkt0_test.inc"  # Относительный путь до файла с фактическими давлениями
+WBP_FACT_TXT: str = "scripts_data/Pfkt0_156.inc"  # Относительный путь до файла с фактическими давлениями
 MODEL_NAMES: list[str] = [
     "Hist_L0_adapt_GC_AQ_bz_YAMB_SWL_new_swl1.2",
 ]
@@ -34,7 +34,7 @@ MAX_CYCLE_DAYS = 400   # Максимальная длина цикла в дн�
 EDGE_BUFFER_DAYS = 30  # Буфер для обработки краев данных в днях
 # БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
 
-PROJECT_FOLDER_PATH: str = get_project_folder()
+PROJECT_FOLDER_PATH: str = get_project_folder()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ПУТЬ К ПРОЕКТУ (пример - I:/L/phg/RedGift_USG)
 
 
 def parse_fact_well_data(file_path: str) -> pd.DataFrame:
@@ -134,10 +134,10 @@ def get_raw_model_data(model_names: list[str], well_names: list[str], parameters
         
         try:
             # Получаем объект модели
-            model = get_model_by_name(model_name)
+            model = get_model_by_name(model_name)  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ОБЪЕКТ-МОДЕЛЬ: <class '__main__.tnav.gc.model_class'>
             
             # Получаем все временные шаги
-            timesteps = get_all_timesteps()
+            timesteps = get_all_timesteps()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ список ОБЪЕКТОВ-ВРЕМЕННЫХ ШАГОВ: <class '__main__.tnav.gc.timestep_class'>
             model_dates = [t.to_datetime() for t in timesteps]
             
             # Создаем структуру для данных модели
@@ -148,7 +148,7 @@ def get_raw_model_data(model_names: list[str], well_names: list[str], parameters
             
             # Получаем список всех скважин в модели
             try:
-                model_wells = get_all_wells()
+                model_wells = get_all_wells()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ список ОБЪЕКТОВ-СКВАЖИН: <class '__main__.tnav.gc.well_class'>
                 model_well_names = [w.name for w in model_wells]
                 print(f"  В модели {len(model_well_names)} скважин")
             except:
@@ -163,7 +163,7 @@ def get_raw_model_data(model_names: list[str], well_names: list[str], parameters
                     continue
                 
                 try:
-                    well = get_well_by_name(well_name)
+                    well = get_well_by_name(well_name)  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ОБЪЕКТ-СКВАЖИНУ о ее имени: <class '__main__.tnav.gc.well_class'>
                     well_data = {}
                     
                     # Загружаем каждый параметр
@@ -172,7 +172,7 @@ def get_raw_model_data(model_names: list[str], well_names: list[str], parameters
                             # Пробуем разные варианты для давления
                             if param == 'wbp':
                                 try:
-                                    graph_data = wbp[model, well]
+                                    graph_data = wbp[model, well]  # # ВСТРОЕННАЯ В ИНСТРУМЕНТ СУЩНОСТЬ - ВОЗВРАЩАЕТ ОБЪЕКТ-ГРАФИК: <class '__main__.tnav.graph'>
                                     print(f"    ✓ {well_name}.{param}: wbp найден")
                                 except Exception as e1:
                                     try:
@@ -1164,7 +1164,10 @@ def compute_model_extremes(well_dataframes):
             
             try:
                 # Ищем экстремумы
-                extremes_df = find_extremes_improved_v2(pressure_df)
+                extremes_df = find_extremes_improved_v2(
+                    pressure_df,
+                    max_cycle_days=30
+                )
                 
                 # Создаем словари для экстремумов
                 maxima_dict = {}
@@ -1783,7 +1786,7 @@ def main():
         
         # 4. Сохраняем данные в Excel с указанной структурой
         print(f"\n3. Сохранение данных в Excel файл...")
-        output_excel = os.path.join(PROJECT_FOLDER_PATH, "structured_comparison_no_interpolation.xlsx")
+        output_excel = os.path.join(PROJECT_FOLDER_PATH, "C:\\Users\\V_Kryazhev\\VSCode\\PHG\\wbp_setting\\structured_comparison_no_interpolation_156.xlsx")
         save_to_excel_structured_single_sheet(well_dataframes, df_fact, models_raw, output_excel)
         
         # Возвращаем данные для дальнейшего использования
