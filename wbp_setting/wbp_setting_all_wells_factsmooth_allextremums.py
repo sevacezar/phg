@@ -30,11 +30,17 @@ SMOOTHING_POLYORDER: int = 3  # Порядок полинома для филь�
 SMOOTHING_INTERP_METHOD: str = 'cubic'  # Метод интерполяции для сглаженной кривой
 MIN_POINTS_FOR_SMOOTHING: int = 5  # Минимальное количество точек для сглаживания
 
-# Настройки поиска экстремумов
+# Настройки поиска экстремумов для исторических данных
 MIN_DISTANCE_DAYS: int = 60  # Минимальное расстояние между экстремумами в днях
 PROMINENCE_PERCENT: float = 2.0  # Минимальная значимость экстремума в процентах от среднего значения
 MAX_CYCLE_DAYS: int = 400  # Максимальная длина цикла в днях
 EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях
+
+# Настройки поиска экстремумов для модельных данных (более чувствительные)
+MODEL_MIN_DISTANCE_DAYS: int = 45  # Минимальное расстояние между экстремумами в днях для моделей
+MODEL_PROMINENCE_PERCENT: float = 1.0  # Минимальная значимость экстремума в процентах для моделей (более чувствительно)
+MODEL_MAX_CYCLE_DAYS: int = 400  # Максимальная длина цикла в днях для моделей
+MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях для моделей
 
 PROJECT_FOLDER_PATH: str = get_project_folder()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ПУТЬ К ПРОЕКТУ (пример - I:/L/phg/RedGift_USG)
 
@@ -744,6 +750,76 @@ def find_extremes_improved_v2(
                 if year_min_val == np.min(window):
                     yearly_extremes.append((year_min_idx, 'min', year_min_val))
     
+    # 2.5. Дополнительный поиск по полугодовым циклам (каждые 6 месяцев)
+    # Это помогает находить экстремумы, которые происходят дважды в год
+    semi_annual_extremes: List[Tuple[int, str, float]] = []
+    
+    # Разбиваем данные на полугодовые периоды
+    if n > 60:  # Минимум 60 точек для полугодового анализа
+        # Создаем периоды по 6 месяцев
+        date_series: pd.Series = pd.Series(result_df['date'])
+        date_series = pd.to_datetime(date_series)
+        
+        # Группируем по полугодиям (январь-июнь и июль-декабрь)
+        for year in years:
+            # Первое полугодие (январь-июнь)
+            h1_mask: pd.Series = (result_df['date'].dt.year == year) & (result_df['date'].dt.month <= 6)
+            h1_indices: np.ndarray = np.where(h1_mask)[0]
+            
+            if len(h1_indices) > 15:  # Минимум 15 точек в полугодии
+                h1_pressures: np.ndarray = pressures[h1_indices]
+                
+                # Максимум первого полугодия
+                h1_max_idx_local: int = np.argmax(h1_pressures)
+                h1_max_idx: int = h1_indices[h1_max_idx_local]
+                h1_max_val: float = h1_pressures[h1_max_idx_local]
+                
+                # Минимум первого полугодия
+                h1_min_idx_local: int = np.argmin(h1_pressures)
+                h1_min_idx: int = h1_indices[h1_min_idx_local]
+                h1_min_val: float = h1_pressures[h1_min_idx_local]
+                
+                # Проверяем значимость
+                window_size_h1: int = min(30, len(h1_indices)//3)
+                if h1_max_idx_local >= window_size_h1 and h1_max_idx_local < len(h1_indices) - window_size_h1:
+                    window_h1_max: np.ndarray = h1_pressures[h1_max_idx_local-window_size_h1:h1_max_idx_local+window_size_h1+1]
+                    if h1_max_val == np.max(window_h1_max) and h1_max_val - h1_min_val > min_prominence * 0.5:
+                        semi_annual_extremes.append((h1_max_idx, 'max', h1_max_val))
+                
+                if h1_min_idx_local >= window_size_h1 and h1_min_idx_local < len(h1_indices) - window_size_h1:
+                    window_h1_min: np.ndarray = h1_pressures[h1_min_idx_local-window_size_h1:h1_min_idx_local+window_size_h1+1]
+                    if h1_min_val == np.min(window_h1_min) and h1_max_val - h1_min_val > min_prominence * 0.5:
+                        semi_annual_extremes.append((h1_min_idx, 'min', h1_min_val))
+            
+            # Второе полугодие (июль-декабрь)
+            h2_mask: pd.Series = (result_df['date'].dt.year == year) & (result_df['date'].dt.month > 6)
+            h2_indices: np.ndarray = np.where(h2_mask)[0]
+            
+            if len(h2_indices) > 15:  # Минимум 15 точек в полугодии
+                h2_pressures: np.ndarray = pressures[h2_indices]
+                
+                # Максимум второго полугодия
+                h2_max_idx_local: int = np.argmax(h2_pressures)
+                h2_max_idx: int = h2_indices[h2_max_idx_local]
+                h2_max_val: float = h2_pressures[h2_max_idx_local]
+                
+                # Минимум второго полугодия
+                h2_min_idx_local: int = np.argmin(h2_pressures)
+                h2_min_idx: int = h2_indices[h2_min_idx_local]
+                h2_min_val: float = h2_pressures[h2_min_idx_local]
+                
+                # Проверяем значимость
+                window_size_h2: int = min(30, len(h2_indices)//3)
+                if h2_max_idx_local >= window_size_h2 and h2_max_idx_local < len(h2_indices) - window_size_h2:
+                    window_h2_max: np.ndarray = h2_pressures[h2_max_idx_local-window_size_h2:h2_max_idx_local+window_size_h2+1]
+                    if h2_max_val == np.max(window_h2_max) and h2_max_val - h2_min_val > min_prominence * 0.5:
+                        semi_annual_extremes.append((h2_max_idx, 'max', h2_max_val))
+                
+                if h2_min_idx_local >= window_size_h2 and h2_min_idx_local < len(h2_indices) - window_size_h2:
+                    window_h2_min: np.ndarray = h2_pressures[h2_min_idx_local-window_size_h2:h2_min_idx_local+window_size_h2+1]
+                    if h2_min_val == np.min(window_h2_min) and h2_max_val - h2_min_val > min_prominence * 0.5:
+                        semi_annual_extremes.append((h2_min_idx, 'min', h2_min_val))
+    
     # 3. Проверка краевых точек
     edge_extremes = []
     
@@ -790,6 +866,10 @@ def find_extremes_improved_v2(
     
     # Добавляем годовые экстремумы
     for idx, typ, val in yearly_extremes:
+        all_extrema_dict[typ].append((idx, val))
+    
+    # Добавляем полугодовые экстремумы
+    for idx, typ, val in semi_annual_extremes:
         all_extrema_dict[typ].append((idx, val))
     
     # Добавляем краевые экстремумы
@@ -1168,8 +1248,14 @@ def compute_model_extremes(
             pressure_df: pd.DataFrame = pd.DataFrame(pressure_data)
             
             try:
-                # Ищем экстремумы
-                extremes_df: pd.DataFrame = find_extremes_improved_v2(pressure_df)
+                # Ищем экстремумы с более чувствительными параметрами для модельных данных
+                extremes_df: pd.DataFrame = find_extremes_improved_v2(
+                    pressure_df,
+                    min_distance_days=MODEL_MIN_DISTANCE_DAYS,
+                    prominence_percent=MODEL_PROMINENCE_PERCENT,
+                    max_cycle_days=MODEL_MAX_CYCLE_DAYS,
+                    edge_buffer_days=MODEL_EDGE_BUFFER_DAYS
+                )
                 
                 # Создаем словари для экстремумов
                 maxima_dict: Dict[str, float] = {}
