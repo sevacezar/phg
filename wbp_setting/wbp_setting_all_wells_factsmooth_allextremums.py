@@ -352,15 +352,21 @@ def create_combined_dataframe_per_well_without_interpolation(
             min_fact_date = well_historical[date_column].min()
             max_fact_date = well_historical[date_column].max()
         
-        # 1. Добавляем фактические данные для этой скважины
-        for _, row in well_historical.iterrows():
-            if pd.notna(row.get(pressure_column)):
-                all_records.append({
-                    'date': row[date_column],
-                    'model': 'HISTORICAL',
-                    'parameter': 'pressure',
-                    'value': row[pressure_column]
-                })
+        # 1. Добавляем фактические данные для этой скважины (vectorized)
+        if not well_historical.empty:
+            fact_mask = well_historical[pressure_column].notna()
+            fact_filtered = well_historical[fact_mask]
+            if not fact_filtered.empty:
+                fact_records = [
+                    {
+                        'date': date,
+                        'model': 'HISTORICAL',
+                        'parameter': 'pressure',
+                        'value': value
+                    }
+                    for date, value in zip(fact_filtered[date_column], fact_filtered[pressure_column])
+                ]
+                all_records.extend(fact_records)
         
         # 2. Добавляем модельные данные для этой скважины (без интерполяции)
         for model_name, model_info in models_raw.items():
@@ -372,21 +378,12 @@ def create_combined_dataframe_per_well_without_interpolation(
                 if min_fact_date and max_fact_date:
                     date_series: pd.Series = pd.Series(model_dates)
                     date_mask: pd.Series = (date_series >= min_fact_date) & (date_series <= max_fact_date)
-                    filtered_dates: List[datetime] = date_series[date_mask].tolist()
+                    filtered_indices: np.ndarray = np.where(date_mask)[0]
                 else:
-                    filtered_dates = model_dates
+                    filtered_indices = np.arange(len(model_dates))
                 
-                if not filtered_dates:
+                if len(filtered_indices) == 0:
                     continue
-                
-                # Сопоставляем даты с индексами
-                date_indices: List[int] = []
-                for date in filtered_dates:
-                    try:
-                        idx: int = model_dates.index(date)
-                        date_indices.append(idx)
-                    except ValueError:
-                        continue
                 
                 # Для каждого параметра
                 for param, all_values in well_data.items():
@@ -400,8 +397,8 @@ def create_combined_dataframe_per_well_without_interpolation(
                         'wgir': 'gas_injection'
                     }.get(param, param)
                     
-                    # Добавляем записи для отфильтрованных дат
-                    for idx in date_indices:
+                    # Добавляем записи для отфильтрованных дат (vectorized)
+                    for idx in filtered_indices:
                         date = model_dates[idx]
                         value = all_values[idx]
                         
@@ -1061,11 +1058,19 @@ def compute_smoothed_pressures_and_extremes(
     
     print(f"  Вычисление сглаженных давлений и экстремумов для {len(well_dataframes)} скважин...")
     
+    # Предварительно группируем исторические данные по скважинам для быстрого доступа
+    historical_by_well: Dict[str, pd.DataFrame] = {}
+    for well_name in historical_df['well_fact'].unique():
+        well_data = historical_df[historical_df['well_fact'] == well_name].copy()
+        well_data['date_fact_dt'] = pd.to_datetime(well_data['date_fact'])
+        # Создаем индекс для быстрого поиска по дате
+        historical_by_well[well_name] = well_data.set_index('date_fact_dt')
+    
     for well_name, df_well in well_dataframes.items():
-        # Извлекаем исторические данные для этой скважины
-        historical_data_well: pd.DataFrame = historical_df[historical_df['well_fact'] == well_name].copy()
+        # Получаем предварительно сгруппированные исторические данные
+        historical_data_well = historical_by_well.get(well_name)
         
-        if historical_data_well.empty:
+        if historical_data_well is None or historical_data_well.empty:
             smoothed_pressures[well_name] = {}
             extremes_data[well_name] = {'maxima': {}, 'minima': {}}
             continue
@@ -1082,9 +1087,6 @@ def compute_smoothed_pressures_and_extremes(
         # в формате, ожидаемом функцией smooth_pressure_timeseries
         pressure_data: List[Dict[str, Any]] = []
         
-        # Преобразуем исторические даты в datetime для корректного сравнения
-        historical_data_well['date_fact_dt'] = pd.to_datetime(historical_data_well['date_fact'])
-        
         for date in all_dates_for_well:
             # Приводим все даты к единому формату datetime
             if isinstance(date, (pd.Timestamp, datetime)):
@@ -1097,19 +1099,31 @@ def compute_smoothed_pressures_and_extremes(
                 except Exception:
                     continue
             
-            # Ищем историческое давление для этой даты
+            # Ищем историческое давление для этой даты (быстрый доступ через индекс)
             hist_pressure: Optional[float] = None
             
-            # Ищем точное совпадение даты
-            exact_match: pd.DataFrame = historical_data_well[historical_data_well['date_fact_dt'] == date_dt]
-            if not exact_match.empty:
-                hist_pressure = exact_match.iloc[0]['wpb_bar_fact']
+            # Пробуем точное совпадение через индекс
+            if date_dt in historical_data_well.index:
+                hist_pressure = historical_data_well.loc[date_dt, 'wpb_bar_fact']
             else:
-                # Ищем ближайшую дату (в пределах 1 дня)
-                time_diffs: pd.Series = (historical_data_well['date_fact_dt'] - date_dt).abs()
-                min_diff_idx: Optional[int] = time_diffs.idxmin() if not time_diffs.empty else None
-                if min_diff_idx is not None and time_diffs[min_diff_idx] <= pd.Timedelta(days=1):
-                    hist_pressure = historical_data_well.loc[min_diff_idx, 'wpb_bar_fact']
+                # Ищем ближайшую дату (в пределах 1 дня) - оптимизированная версия
+                # Используем searchsorted для бинарного поиска (быстрее чем полный перебор)
+                date_series = historical_data_well.index
+                if len(date_series) > 0:
+                    # Бинарный поиск ближайшей даты
+                    pos = date_series.searchsorted(date_dt)
+                    candidates = []
+                    
+                    # Проверяем позицию и соседние
+                    if pos < len(date_series):
+                        candidates.append((abs((date_series[pos] - date_dt).days), pos))
+                    if pos > 0:
+                        candidates.append((abs((date_series[pos-1] - date_dt).days), pos-1))
+                    
+                    if candidates:
+                        min_diff_days, min_idx = min(candidates, key=lambda x: x[0])
+                        if min_diff_days <= 1:
+                            hist_pressure = historical_data_well.iloc[min_idx]['wpb_bar_fact']
             
             # Сохраняем дату в строковом формате для функции smooth_pressure_timeseries
             pressure_data.append({
@@ -1132,38 +1146,47 @@ def compute_smoothed_pressures_and_extremes(
             # Поиск экстремумов в сглаженных данных
             extremes_df: pd.DataFrame = find_extremes_improved_v2(smoothed_df)
             
-            # Создаем словарь для быстрого доступа к сглаженным значениям по дате
-            smoothed_dict: Dict[str, float] = {}
-            maxima_dict: Dict[str, float] = {}
-            minima_dict: Dict[str, float] = {}
+            # Создаем словарь для быстрого доступа к сглаженным значениям по дате (vectorized)
+            def normalize_date_key(date_val):
+                """Нормализует дату в формат YYYY-MM-DD"""
+                try:
+                    if isinstance(date_val, str):
+                        try:
+                            date_dt = datetime.strptime(date_val, '%d.%m.%Y')
+                        except Exception:
+                            date_dt = pd.to_datetime(date_val)
+                    elif isinstance(date_val, (pd.Timestamp, datetime)):
+                        date_dt = date_val
+                    elif isinstance(date_val, np.datetime64):
+                        date_dt = pd.Timestamp(date_val)
+                    else:
+                        date_dt = pd.to_datetime(date_val)
+                    return date_dt.strftime('%Y-%m-%d')
+                except Exception:
+                    return str(date_val)
             
-            for _, row in extremes_df.iterrows():
-                date_str: Union[str, datetime, pd.Timestamp] = row['date']
-                # Преобразуем дату обратно в datetime для использования в качестве ключа
-                if isinstance(date_str, str):
-                    try:
-                        date_dt = datetime.strptime(date_str, '%d.%m.%Y')
-                    except Exception:
-                        date_dt = pd.to_datetime(date_str)
-                else:
-                    date_dt = date_str
-                
-                # Приводим к единому формату datetime для использования в качестве ключа
-                if isinstance(date_dt, (pd.Timestamp, datetime)):
-                    date_key: str = date_dt.strftime('%Y-%m-%d')
-                elif isinstance(date_dt, np.datetime64):
-                    date_key = pd.Timestamp(date_dt).strftime('%Y-%m-%d')
-                else:
-                    date_key = str(date_dt)
-                
-                smoothed_value: float = row['pressure_smoothed']
-                smoothed_dict[date_key] = smoothed_value
-                
-                # Сохраняем экстремумы, если они есть
-                if pd.notna(row['maxima']):
-                    maxima_dict[date_key] = row['maxima']
-                if pd.notna(row['minima']):
-                    minima_dict[date_key] = row['minima']
+            # Преобразуем даты в нормализованный формат (vectorized)
+            extremes_df['date_key'] = extremes_df['date'].apply(normalize_date_key)
+            
+            # Создаем словари (vectorized)
+            smoothed_dict = dict(zip(
+                extremes_df['date_key'],
+                extremes_df['pressure_smoothed']
+            ))
+            
+            # Фильтруем и создаем словари экстремумов (vectorized)
+            maxima_mask = extremes_df['maxima'].notna()
+            minima_mask = extremes_df['minima'].notna()
+            
+            maxima_dict = dict(zip(
+                extremes_df.loc[maxima_mask, 'date_key'],
+                extremes_df.loc[maxima_mask, 'maxima']
+            )) if maxima_mask.any() else {}
+            
+            minima_dict = dict(zip(
+                extremes_df.loc[minima_mask, 'date_key'],
+                extremes_df.loc[minima_mask, 'minima']
+            )) if minima_mask.any() else {}
             
             smoothed_pressures[well_name] = smoothed_dict
             extremes_data[well_name] = {
@@ -1222,29 +1245,29 @@ def compute_model_extremes(
                 model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
                 continue
             
-            # Подготавливаем данные для поиска экстремумов
-            pressure_data: List[Dict[str, Any]] = []
+            # Подготавливаем данные для поиска экстремумов (vectorized)
+            # Фильтруем NaN значения
+            model_pressure_df_clean = model_pressure_df[model_pressure_df['value'].notna()].copy()
             
-            for _, row in model_pressure_df.iterrows():
-                date: Union[pd.Timestamp, datetime, np.datetime64, str] = row['date']
-                value: float = row['value']
-                
-                # Пропускаем NaN значения
-                if pd.isna(value):
-                    continue
-                
-                # Преобразуем дату в строковый формат
-                if isinstance(date, (pd.Timestamp, datetime)):
-                    date_str: str = date.strftime('%d.%m.%Y')
-                elif isinstance(date, np.datetime64):
-                    date_str = pd.Timestamp(date).strftime('%d.%m.%Y')
+            if model_pressure_df_clean.empty:
+                model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
+                continue
+            
+            # Преобразуем даты в строковый формат (vectorized)
+            def format_date(date_val):
+                if isinstance(date_val, (pd.Timestamp, datetime)):
+                    return date_val.strftime('%d.%m.%Y')
+                elif isinstance(date_val, np.datetime64):
+                    return pd.Timestamp(date_val).strftime('%d.%m.%Y')
                 else:
-                    date_str = str(date)
-                
-                pressure_data.append({
-                    'date': date_str,
-                    'pressure_smoothed': value
-                })
+                    return str(date_val)
+            
+            model_pressure_df_clean['date_str'] = model_pressure_df_clean['date'].apply(format_date)
+            
+            pressure_data = [
+                {'date': date_str, 'pressure_smoothed': value}
+                for date_str, value in zip(model_pressure_df_clean['date_str'], model_pressure_df_clean['value'])
+            ]
             
             if len(pressure_data) < 10:
                 model_extremes[well_name][model_name] = {'maxima': {}, 'minima': {}}
@@ -1263,35 +1286,37 @@ def compute_model_extremes(
                     edge_buffer_days=MODEL_EDGE_BUFFER_DAYS
                 )
                 
-                # Создаем словари для экстремумов
-                maxima_dict: Dict[str, float] = {}
-                minima_dict: Dict[str, float] = {}
-                
-                for _, row in extremes_df.iterrows():
-                    date_str: Union[str, datetime, pd.Timestamp] = row['date']
-                    # Преобразуем дату в строковый формат YYYY-MM-DD для ключа
-                    if isinstance(date_str, str):
-                        try:
-                            date_dt: datetime = datetime.strptime(date_str, '%d.%m.%Y')
-                            date_key: str = date_dt.strftime('%Y-%m-%d')
-                        except Exception:
+                # Создаем словари для экстремумов (vectorized)
+                def normalize_date_key(date_val):
+                    """Нормализует дату в формат YYYY-MM-DD"""
+                    try:
+                        if isinstance(date_val, str):
                             try:
-                                date_dt = pd.to_datetime(date_str)
-                                date_key = date_dt.strftime('%Y-%m-%d')
+                                date_dt = datetime.strptime(date_val, '%d.%m.%Y')
                             except Exception:
-                                date_key = date_str
-                    else:
-                        try:
-                            date_dt = pd.to_datetime(date_str)
-                            date_key = date_dt.strftime('%Y-%m-%d')
-                        except Exception:
-                            date_key = str(date_str)
-                    
-                    # Сохраняем экстремумы
-                    if pd.notna(row['maxima']):
-                        maxima_dict[date_key] = row['maxima']
-                    if pd.notna(row['minima']):
-                        minima_dict[date_key] = row['minima']
+                                date_dt = pd.to_datetime(date_val)
+                        else:
+                            date_dt = pd.to_datetime(date_val)
+                        return date_dt.strftime('%Y-%m-%d')
+                    except Exception:
+                        return str(date_val)
+                
+                # Преобразуем даты в нормализованный формат (vectorized)
+                extremes_df['date_key'] = extremes_df['date'].apply(normalize_date_key)
+                
+                # Фильтруем и создаем словари (vectorized)
+                maxima_mask = extremes_df['maxima'].notna()
+                minima_mask = extremes_df['minima'].notna()
+                
+                maxima_dict = dict(zip(
+                    extremes_df.loc[maxima_mask, 'date_key'],
+                    extremes_df.loc[maxima_mask, 'maxima']
+                ))
+                
+                minima_dict = dict(zip(
+                    extremes_df.loc[minima_mask, 'date_key'],
+                    extremes_df.loc[minima_mask, 'minima']
+                ))
                 
                 model_extremes[well_name][model_name] = {
                     'maxima': maxima_dict,
@@ -2005,28 +2030,28 @@ def prepare_graph_data(
                 # Сортируем по дате
                 fact_data_df = fact_data_df.sort_values('date')
                 
-                # Извлекаем даты и давления
-                dates: List[str] = []
-                wbp: List[float] = []
+                # Извлекаем даты и давления (vectorized)
+                # Фильтруем NaN значения
+                fact_data_df_clean = fact_data_df[fact_data_df['value'].notna()].copy()
                 
-                for _, row in fact_data_df.iterrows():
-                    date = row['date']
-                    value = row['value']
+                if not fact_data_df_clean.empty:
+                    # Преобразуем даты в строки (vectorized)
+                    def format_date_to_str(date_val):
+                        if isinstance(date_val, (pd.Timestamp, datetime)):
+                            return date_val.strftime('%Y-%m-%d')
+                        elif isinstance(date_val, np.datetime64):
+                            return pd.Timestamp(date_val).strftime('%Y-%m-%d')
+                        else:
+                            try:
+                                return pd.to_datetime(date_val).strftime('%Y-%m-%d')
+                            except Exception:
+                                return str(date_val)
                     
-                    # Преобразуем дату в строку
-                    if isinstance(date, (pd.Timestamp, datetime)):
-                        date_str = date.strftime('%Y-%m-%d')
-                    elif isinstance(date, np.datetime64):
-                        date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
-                    else:
-                        try:
-                            date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
-                        except Exception:
-                            date_str = str(date)
-                    
-                    if pd.notna(value):
-                        dates.append(date_str)
-                        wbp.append(float(value))
+                    dates = fact_data_df_clean['date'].apply(format_date_to_str).tolist()
+                    wbp = fact_data_df_clean['value'].astype(float).tolist()
+                else:
+                    dates = []
+                    wbp = []
                 
                 well_data['fact'] = {
                     'dates': dates,
@@ -2085,28 +2110,28 @@ def prepare_graph_data(
                     # Сортируем по дате
                     model_data_df = model_data_df.sort_values('date')
                     
-                    # Извлекаем даты и давления
-                    dates: List[str] = []
-                    wbp: List[float] = []
+                    # Извлекаем даты и давления (vectorized)
+                    # Фильтруем NaN значения
+                    model_data_df_clean = model_data_df[model_data_df['value'].notna()].copy()
                     
-                    for _, row in model_data_df.iterrows():
-                        date = row['date']
-                        value = row['value']
+                    if not model_data_df_clean.empty:
+                        # Преобразуем даты в строки (vectorized)
+                        def format_date_to_str(date_val):
+                            if isinstance(date_val, (pd.Timestamp, datetime)):
+                                return date_val.strftime('%Y-%m-%d')
+                            elif isinstance(date_val, np.datetime64):
+                                return pd.Timestamp(date_val).strftime('%Y-%m-%d')
+                            else:
+                                try:
+                                    return pd.to_datetime(date_val).strftime('%Y-%m-%d')
+                                except Exception:
+                                    return str(date_val)
                         
-                        # Преобразуем дату в строку
-                        if isinstance(date, (pd.Timestamp, datetime)):
-                            date_str = date.strftime('%Y-%m-%d')
-                        elif isinstance(date, np.datetime64):
-                            date_str = pd.Timestamp(date).strftime('%Y-%m-%d')
-                        else:
-                            try:
-                                date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
-                            except Exception:
-                                date_str = str(date)
-                        
-                        if pd.notna(value):
-                            dates.append(date_str)
-                            wbp.append(float(value))
+                        dates = model_data_df_clean['date'].apply(format_date_to_str).tolist()
+                        wbp = model_data_df_clean['value'].astype(float).tolist()
+                    else:
+                        dates = []
+                        wbp = []
                     
                     well_data[model_name] = {
                         'dates': dates,
