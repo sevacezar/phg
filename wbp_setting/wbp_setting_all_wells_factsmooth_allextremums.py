@@ -12,9 +12,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter, find_peaks
 from scipy.interpolate import interp1d
-import openpyxl
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
 
 
 # ============================================================================
@@ -821,27 +819,9 @@ def find_extremes_improved_v2(
                         semi_annual_extremes.append((h2_min_idx, 'min', h2_min_val))
     
     # 3. Проверка краевых точек
-    # ============================================================================
-    # БУФЕР ДЛЯ ОБРАБОТКИ КРАЕВЫХ ДАННЫХ (EDGE_BUFFER_DAYS):
-    # 
-    # Проблема: стандартные алгоритмы поиска экстремумов (find_peaks) могут
-    # пропускать экстремумы в начале и конце временного ряда, так как у них
-    # недостаточно соседних точек для проверки локальности.
-    #
-    # Решение: используем специальную обработку для краевых областей:
-    # 1. edge_buffer_days (по умолчанию 30 дней) определяет размер буфера
-    # 2. Конвертируем дни в количество точек: edge_points = edge_buffer_days / avg_days_between_points
-    # 3. Для начала данных: анализируем окно pressures[:edge_points*2]
-    # 4. Для конца данных: анализируем окно pressures[-edge_points*2:]
-    # 5. В каждом окне ищем максимум и минимум
-    # 6. Для последних точек (особенно самой последней) используем более мягкие критерии:
-    #    - Порог значимости снижается до 20-40% от стандартного
-    #    - Проверяем только локальность относительно соседних точек
-    # 7. Это позволяет учитывать экстремумы в точках типа 2025-02-27 (последняя точка)
-    # ============================================================================
     edge_extremes = []
     
-    # Конвертируем размер буфера из дней в количество точек
+    # Проверяем первые edge_buffer_days дней
     edge_points = int(edge_buffer_days / avg_days_between_points) if avg_days_between_points > 0 else 30
     edge_points = min(edge_points, n//4)
     
@@ -854,28 +834,13 @@ def find_extremes_improved_v2(
             start_min_idx = np.argmin(start_window)
             start_min_val = start_window[start_min_idx]
             
-            # Проверяем значимость (более мягкое условие для краевых точек)
-            # Для начала данных: экстремум не должен быть самой первой точкой
-            if start_max_idx > 0:
-                # Проверяем, что это локальный максимум (больше соседних точек)
-                if start_max_idx < len(start_window) - 1:
-                    # Не на краю окна - стандартная проверка
-                    if start_max_val - start_min_val > min_prominence * 0.7:  # Более мягкий порог
-                        edge_extremes.append((start_max_idx, 'max', start_max_val))
-                elif start_max_val > pressures[start_max_idx + 1] if start_max_idx + 1 < n else False:
-                    # На краю окна, но все равно локальный максимум
-                    if start_max_val - start_min_val > min_prominence * 0.5:  # Еще более мягкий порог
-                        edge_extremes.append((start_max_idx, 'max', start_max_val))
-            
-            if start_min_idx > 0:
-                if start_min_idx < len(start_window) - 1:
-                    if start_max_val - start_min_val > min_prominence * 0.7:
-                        edge_extremes.append((start_min_idx, 'min', start_min_val))
-                elif start_min_val < pressures[start_min_idx + 1] if start_min_idx + 1 < n else False:
-                    if start_max_val - start_min_val > min_prominence * 0.5:
-                        edge_extremes.append((start_min_idx, 'min', start_min_val))
+            # Проверяем значимость
+            if start_max_idx > 0 and start_max_idx < len(start_window)-1:
+                if start_max_val - start_min_val > min_prominence:
+                    edge_extremes.append((start_max_idx, 'max', start_max_val))
+                    edge_extremes.append((start_min_idx, 'min', start_min_val))
         
-        # Проверяем конец данных (улучшенная логика для последних точек)
+        # Проверяем конец данных
         end_window = pressures[-edge_points*2:]
         if len(end_window) > 0:
             end_max_idx = n - len(end_window) + np.argmax(end_window)
@@ -883,65 +848,10 @@ def find_extremes_improved_v2(
             end_min_idx = n - len(end_window) + np.argmin(end_window)
             end_min_val = pressures[end_min_idx]
             
-            # Специальная обработка для самой последней точки (индекс n-1)
-            # Если последняя точка является экстремумом в окне, она должна учитываться
-            if end_max_idx == n - 1:
-                # Последняя точка - максимум в окне
-                # Проверяем, что она больше предыдущей точки (локальный максимум)
-                if n > 1 and end_max_val >= pressures[n - 2]:
-                    # Используем очень мягкий порог для последней точки
-                    if end_max_val - end_min_val > min_prominence * 0.2:
-                        edge_extremes.append((end_max_idx, 'max', end_max_val))
-            
-            if end_min_idx == n - 1:
-                # Последняя точка - минимум в окне
-                if n > 1 and end_min_val <= pressures[n - 2]:
-                    if end_max_val - end_min_val > min_prominence * 0.2:
-                        edge_extremes.append((end_min_idx, 'min', end_min_val))
-            
-            # Более гибкая проверка для других точек в конце данных
-            # Проверяем, что это локальный экстремум относительно соседних точек
-            if end_max_idx != n - 1:  # Если это не последняя точка
-                is_max_local = True
-                
-                # Для максимума: проверяем, что он больше соседних точек
-                if end_max_idx > 0:
-                    is_max_local = is_max_local and (end_max_val >= pressures[end_max_idx - 1])
-                if end_max_idx < n - 1:
-                    is_max_local = is_max_local and (end_max_val >= pressures[end_max_idx + 1])
-                
-                # Добавляем экстремум, если он локальный и значимый
-                if is_max_local:
-                    # Для предпоследней точки используем более мягкий порог
-                    if end_max_idx >= n - 2:
-                        prominence_threshold = min_prominence * 0.4
-                    elif end_max_idx >= n - edge_points:
-                        prominence_threshold = min_prominence * 0.6
-                    else:
-                        prominence_threshold = min_prominence * 0.7
-                    
-                    if end_max_val - end_min_val > prominence_threshold:
-                        edge_extremes.append((end_max_idx, 'max', end_max_val))
-            
-            if end_min_idx != n - 1:  # Если это не последняя точка
-                is_min_local = True
-                
-                # Для минимума: проверяем, что он меньше соседних точек
-                if end_min_idx > 0:
-                    is_min_local = is_min_local and (end_min_val <= pressures[end_min_idx - 1])
-                if end_min_idx < n - 1:
-                    is_min_local = is_min_local and (end_min_val <= pressures[end_min_idx + 1])
-                
-                if is_min_local:
-                    if end_min_idx >= n - 2:
-                        prominence_threshold = min_prominence * 0.4
-                    elif end_min_idx >= n - edge_points:
-                        prominence_threshold = min_prominence * 0.6
-                    else:
-                        prominence_threshold = min_prominence * 0.7
-                    
-                    if end_max_val - end_min_val > prominence_threshold:
-                        edge_extremes.append((end_min_idx, 'min', end_min_val))
+            if end_max_idx > n - len(end_window) and end_max_idx < n-1:
+                if end_max_val - end_min_val > min_prominence:
+                    edge_extremes.append((end_max_idx, 'max', end_max_val))
+                    edge_extremes.append((end_min_idx, 'min', end_min_val))
     
     # 4. Объединяем все найденные экстремумы
     all_extrema_dict: Dict[str, List[Tuple[int, float]]] = {'max': [], 'min': []}
@@ -1386,6 +1296,274 @@ def compute_model_extremes(
     return model_extremes
 
 
+def collect_last_extremes(
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]],
+    num_extremes: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Собирает последние N максимумов и минимумов для факта и всех моделей.
+    
+    Parameters
+    ----------
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных: {well: {'maxima': {date: value}, 'minima': {date: value}}}
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей: {well: {model: {'maxima': {date: value}, 'minima': {date: value}}}}
+    num_extremes : int
+        Количество последних экстремумов для сбора (по умолчанию 5)
+    
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Список словарей с данными: well, model_name, extremum_type, extremum_order, date, wbp
+    """
+    result: List[Dict[str, Any]] = []
+    
+    # Получаем все скважины
+    all_wells: set = set(extremes_data.keys())
+    all_wells.update(model_extremes.keys())
+    
+    for well_name in all_wells:
+        # Обрабатываем фактические данные
+        if well_name in extremes_data:
+            fact_data = extremes_data[well_name]
+            
+            # Собираем максимумы факта
+            fact_maxima = fact_data.get('maxima', {})
+            if fact_maxima:
+                # Сортируем по дате (от новых к старым) и берем последние num_extremes
+                sorted_maxima = sorted(
+                    [(date, value) for date, value in fact_maxima.items()],
+                    key=lambda x: x[0],
+                    reverse=True
+                )[:num_extremes]
+                
+                # Нумеруем от 1 до num_extremes (1 - самый последний)
+                for order, (date_str, value) in enumerate(sorted_maxima, 1):
+                    result.append({
+                        'well': well_name,
+                        'model_name': 'FACT',
+                        'extremum_type': 'max',
+                        'extremum_order': order,
+                        'date': date_str,
+                        'wbp': value
+                    })
+            
+            # Собираем минимумы факта
+            fact_minima = fact_data.get('minima', {})
+            if fact_minima:
+                sorted_minima = sorted(
+                    [(date, value) for date, value in fact_minima.items()],
+                    key=lambda x: x[0],
+                    reverse=True
+                )[:num_extremes]
+                
+                for order, (date_str, value) in enumerate(sorted_minima, 1):
+                    result.append({
+                        'well': well_name,
+                        'model_name': 'FACT',
+                        'extremum_type': 'min',
+                        'extremum_order': order,
+                        'date': date_str,
+                        'wbp': value
+                    })
+        
+        # Обрабатываем модельные данные
+        if well_name in model_extremes:
+            for model_name, model_data in model_extremes[well_name].items():
+                # Максимумы модели
+                model_maxima = model_data.get('maxima', {})
+                if model_maxima:
+                    sorted_maxima = sorted(
+                        [(date, value) for date, value in model_maxima.items()],
+                        key=lambda x: x[0],
+                        reverse=True
+                    )[:num_extremes]
+                    
+                    for order, (date_str, value) in enumerate(sorted_maxima, 1):
+                        result.append({
+                            'well': well_name,
+                            'model_name': model_name,
+                            'extremum_type': 'max',
+                            'extremum_order': order,
+                            'date': date_str,
+                            'wbp': value
+                        })
+                
+                # Минимумы модели
+                model_minima = model_data.get('minima', {})
+                if model_minima:
+                    sorted_minima = sorted(
+                        [(date, value) for date, value in model_minima.items()],
+                        key=lambda x: x[0],
+                        reverse=True
+                    )[:num_extremes]
+                    
+                    for order, (date_str, value) in enumerate(sorted_minima, 1):
+                        result.append({
+                            'well': well_name,
+                            'model_name': model_name,
+                            'extremum_type': 'min',
+                            'extremum_order': order,
+                            'date': date_str,
+                            'wbp': value
+                        })
+    
+    return result
+
+
+def calculate_quality_metrics(
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]],
+    num_extremes: int = 5
+) -> List[Dict[str, Any]]:
+    """
+    Вычисляет метрики качества соответствия моделей факту.
+    
+    Parameters
+    ----------
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей
+    num_extremes : int
+        Количество экстремумов для сравнения (по умолчанию 5)
+    
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Список словарей с метриками: well, model_name, phase_deviation_days, 
+        amplitude_deviation, max_deviation, min_deviation
+        Все метрики сохраняют знак для понимания направления отклонения:
+        - phase_deviation_days: положительное = модель опережает, отрицательное = отстает
+        - amplitude_deviation: положительное = амплитуда модели больше, отрицательное = меньше
+        - max_deviation: положительное = максимумы модели выше, отрицательное = ниже
+        - min_deviation: положительное = минимумы модели выше, отрицательное = ниже
+    """
+    result: List[Dict[str, Any]] = []
+    
+    # Получаем все скважины
+    all_wells: set = set(extremes_data.keys())
+    all_wells.update(model_extremes.keys())
+    
+    for well_name in all_wells:
+        if well_name not in extremes_data:
+            continue
+        
+        fact_data = extremes_data[well_name]
+        fact_maxima = fact_data.get('maxima', {})
+        fact_minima = fact_data.get('minima', {})
+        
+        # Получаем последние N экстремумов факта
+        fact_max_sorted = sorted(
+            [(date, value) for date, value in fact_maxima.items()],
+            key=lambda x: x[0],
+            reverse=True
+        )[:num_extremes]
+        
+        fact_min_sorted = sorted(
+            [(date, value) for date, value in fact_minima.items()],
+            key=lambda x: x[0],
+            reverse=True
+        )[:num_extremes]
+        
+        # Обрабатываем каждую модель
+        if well_name in model_extremes:
+            for model_name, model_data in model_extremes[well_name].items():
+                model_maxima = model_data.get('maxima', {})
+                model_minima = model_data.get('minima', {})
+                
+                model_max_sorted = sorted(
+                    [(date, value) for date, value in model_maxima.items()],
+                    key=lambda x: x[0],
+                    reverse=True
+                )[:num_extremes]
+                
+                model_min_sorted = sorted(
+                    [(date, value) for date, value in model_minima.items()],
+                    key=lambda x: x[0],
+                    reverse=True
+                )[:num_extremes]
+                
+                # Вычисляем метрики (без abs, чтобы видеть направление отклонения)
+                phase_deviations: List[float] = []
+                amplitude_deviations: List[float] = []
+                max_deviations: List[float] = []
+                min_deviations: List[float] = []
+                
+                # Сопоставляем максимумы (последний с последним и т.д.)
+                num_max_pairs = min(len(fact_max_sorted), len(model_max_sorted))
+                for i in range(num_max_pairs):
+                    fact_date_str, fact_value = fact_max_sorted[i]
+                    model_date_str, model_value = model_max_sorted[i]
+                    
+                    # Отклонение по фазе (в днях, положительное = модель опережает, отрицательное = отстает)
+                    try:
+                        fact_date = pd.to_datetime(fact_date_str)
+                        model_date = pd.to_datetime(model_date_str)
+                        phase_diff = (model_date - fact_date).days  # Без abs для сохранения знака
+                        phase_deviations.append(phase_diff)
+                    except Exception:
+                        pass
+                    
+                    # Отклонение максимума (положительное = модель выше, отрицательное = ниже)
+                    max_deviations.append(model_value - fact_value)
+                
+                # Сопоставляем минимумы
+                num_min_pairs = min(len(fact_min_sorted), len(model_min_sorted))
+                for i in range(num_min_pairs):
+                    fact_date_str, fact_value = fact_min_sorted[i]
+                    model_date_str, model_value = model_min_sorted[i]
+                    
+                    # Отклонение по фазе
+                    try:
+                        fact_date = pd.to_datetime(fact_date_str)
+                        model_date = pd.to_datetime(model_date_str)
+                        phase_diff = (model_date - fact_date).days  # Без abs для сохранения знака
+                        phase_deviations.append(phase_diff)
+                    except Exception:
+                        pass
+                    
+                    # Отклонение минимума (положительное = модель выше, отрицательное = ниже)
+                    min_deviations.append(model_value - fact_value)
+                
+                # Вычисляем разность амплитуд для пар максимум-минимум
+                # Сопоставляем пары экстремумов (последний максимум с последним минимумом и т.д.)
+                num_amplitude_pairs = min(num_max_pairs, num_min_pairs)
+                for i in range(num_amplitude_pairs):
+                    # Амплитуда факта (разница между максимумом и минимумом)
+                    fact_max_value = fact_max_sorted[i][1]
+                    fact_min_value = fact_min_sorted[i][1]
+                    fact_amplitude = fact_max_value - fact_min_value  # Без abs для сохранения знака
+                    
+                    # Амплитуда модели
+                    model_max_value = model_max_sorted[i][1]
+                    model_min_value = model_min_sorted[i][1]
+                    model_amplitude = model_max_value - model_min_value  # Без abs для сохранения знака
+                    
+                    # Разность амплитуд (положительное = амплитуда модели больше, отрицательное = меньше)
+                    amplitude_diff = model_amplitude - fact_amplitude
+                    amplitude_deviations.append(amplitude_diff)
+                
+                # Вычисляем средние значения
+                phase_deviation_days = np.mean(phase_deviations) if phase_deviations else None
+                amplitude_deviation = np.mean(amplitude_deviations) if amplitude_deviations else None
+                max_deviation = np.mean(max_deviations) if max_deviations else None
+                min_deviation = np.mean(min_deviations) if min_deviations else None
+                
+                result.append({
+                    'well': well_name,
+                    'model_name': model_name,
+                    'phase_deviation_days': phase_deviation_days,
+                    'amplitude_deviation': amplitude_deviation,
+                    'max_deviation': max_deviation,
+                    'min_deviation': min_deviation
+                })
+    
+    return result
+
+
 def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models_data, 
                                         output_path="structured_comparison_single_sheet.xlsx"):
     """
@@ -1407,29 +1585,11 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
     output_path : str
         Путь для сохранения Excel файл
     """
-    print(f"\nСохранение данных в Excel файл (единая таблица): {output_path}")
-    
     # Вычисляем сглаженные давления и экстремумы
-    print("  Вычисление сглаженных давлений и экстремумов...")
     smoothed_pressures, extremes_data = compute_smoothed_pressures_and_extremes(well_dataframes, historical_df)
     
     # Вычисляем экстремумы для модельных давлений
     model_extremes = compute_model_extremes(well_dataframes)
-    
-    # Отладочная информация о сглаженных данных и экстремумах
-    print(f"  Информация о сглаженных данных и экстремумах:")
-    for well_name in smoothed_pressures.keys():
-        smoothed_count = len(smoothed_pressures[well_name])
-        maxima_count = len(extremes_data[well_name]['maxima'])
-        minima_count = len(extremes_data[well_name]['minima'])
-        print(f"    {well_name}: {smoothed_count} сглаженных, {maxima_count} максимумов, {minima_count} минимумов")
-        
-        # Информация о модельных экстремумах
-        if well_name in model_extremes:
-            for model_name in model_extremes[well_name]:
-                model_max = len(model_extremes[well_name][model_name]['maxima'])
-                model_min = len(model_extremes[well_name][model_name]['minima'])
-                print(f"      Модель {model_name}: {model_max} максимумов, {model_min} минимумов")
     
     # Создаем новый Workbook
     wb = Workbook()
@@ -1443,13 +1603,9 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
     all_models = sorted(all_models)
     
     if not all_models:
-        print("    Предупреждение: нет модельных данных")
         ws.append(["Нет модельных данных"])
         wb.save(output_path)
-        return output_path
-    
-    print(f"  Найдено моделей: {all_models}")
-    print(f"  Всего скважин: {len(well_dataframes)}")
+        return wb, extremes_data, model_extremes
     
     # === СТРОКА 1: Заголовки таблицы ===
     header_row1 = ['well', 'date', 'wbp_hist', 'wbp_hist_smoothed', 'wbp_hist_smoothed_max', 'wbp_hist_smoothed_min']
@@ -1478,13 +1634,10 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
     total_rows = 0
     
     for well_idx, (well_name, df_well) in enumerate(well_dataframes.items()):
-        print(f"  Обработка скважины {well_name} ({well_idx+1}/{len(well_dataframes)})...")
-        
         # Получаем уникальные даты для этой скважины (уже отсортированы)
         well_dates = sorted(df_well['date'].unique())
         
         if not well_dates:
-            print(f"    Предупреждение: для скважины {well_name} нет данных по датам")
             continue
         
         # Для каждой даты создаем строку данных
@@ -1667,196 +1820,170 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
             # Добавляем строку в таблицу
             ws.append(data_row)
             total_rows += 1
-        
-        print(f"    ✓ Добавлено {len(well_dates)} строк для скважины {well_name}")
     
-    # Автонастройка ширины столбцов
-    print("  Настройка ширины столбцов...")
-    for column in ws.columns:
-        max_length = 0
-        column_letter = column[0].column_letter
-        for cell in column:
-            if cell.value:
-                max_length = max(max_length, len(str(cell.value)))
-        adjusted_width = min(max_length + 2, 30)
-        ws.column_dimensions[column_letter].width = adjusted_width
+    # Сохраняем файл (без форматирования для ускорения)
+    try:
+        wb.save(output_path)
+    except Exception as e:
+        print(f"✗ Ошибка при сохранении файла: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Определяем последнюю колонку для фильтра
-    last_col = openpyxl.utils.get_column_letter(ws.max_column)
+    return wb, extremes_data, model_extremes
+
+
+def save_extremes_to_excel_sheet(
+    wb: Workbook,
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+) -> None:
+    """
+    Сохраняет данные о последних экстремумах на второй лист Excel.
     
-    # Добавляем фильтры и закрепляем заголовки
-    print("  Применение фильтров...")
-    ws.auto_filter.ref = f"A1:{last_col}2"  # Фильтр на первых двух строках заголовков
-    ws.freeze_panes = "A3"  # Закрепляем первые две строки заголовков
+    Parameters
+    ----------
+    wb : Workbook
+        Рабочая книга Excel
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей
+    """
+    print("  Сохранение данных об экстремумах на лист 2...")
     
-    # Добавляем информационную строку в начало
-    ws.insert_rows(1)
+    # Создаем или получаем второй лист
+    if len(wb.worksheets) < 2:
+        ws = wb.create_sheet("Экстремумы")
+    else:
+        ws = wb.worksheets[1]
+        ws.title = "Экстремумы"
     
-    info_cell = ws['A1']
-    info_cell.value = f"Сравнение моделей и фактических данных | Скважин: {len(well_dataframes)} | Строк данных: {total_rows} | Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    info_cell.font = Font(bold=True, color="FFFFFF")
-    info_cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-    info_cell.alignment = Alignment(horizontal="center")
+    # Заголовки
+    ws.append(['well', 'model_name', 'extremum_type', 'extremum_order', 'date', 'wbp'])
     
-    # Объединяем ячейки информационной строки
-    ws.merge_cells(f'A1:{last_col}1')
+    # Собираем данные об экстремумах
+    extremes_list = collect_last_extremes(extremes_data, model_extremes, num_extremes=5)
     
-    # Форматирование заголовков таблицы (строки 2 и 3)
-    # Строка 2: Основные заголовки
-    for cell in ws[2]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    # Записываем данные
+    for item in extremes_list:
+        ws.append([
+            item['well'],
+            item['model_name'],
+            item['extremum_type'],
+            item['extremum_order'],
+            item['date'],
+            item['wbp']
+        ])
     
-    # Строка 3: Подзаголовки параметров
-    for cell in ws[3]:
-        if cell.column > 6:  # Начиная с 7-го столбца (после well, date, wbp_hist, wbp_hist_smoothed, wbp_hist_smoothed_max, wbp_hist_smoothed_min)
-            cell.font = Font(italic=True, bold=True)
-            cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    print(f"    ✓ Сохранено {len(extremes_list)} записей об экстремумах")
+
+
+def save_quality_metrics_to_excel_sheet(
+    wb: Workbook,
+    extremes_data: Dict[str, Dict[str, Dict[str, float]]],
+    model_extremes: Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+) -> None:
+    """
+    Сохраняет метрики качества соответствия моделей факту на третий лист Excel.
     
-    # Добавляем условное форматирование
-    # Зеленый цвет для сглаженных значений (столбец D)
-    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    Parameters
+    ----------
+    wb : Workbook
+        Рабочая книга Excel
+    extremes_data : Dict[str, Dict[str, Dict[str, float]]]
+        Экстремумы для фактических данных
+    model_extremes : Dict[str, Dict[str, Dict[str, Dict[str, float]]]]
+        Экстремумы для моделей
+    """
+    print("  Сохранение метрик качества на лист 3...")
     
-    # Красный цвет для максимумов сглаженных данных (столбец E)
-    red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    # Создаем или получаем третий лист
+    if len(wb.worksheets) < 3:
+        ws = wb.create_sheet("Качество соответствия")
+    else:
+        ws = wb.worksheets[2]
+        ws.title = "Качество соответствия"
     
-    # Синий цвет для минимумов сглаженных данных (столбец F)
-    blue_fill = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    # Заголовки
+    ws.append([
+        'well',
+        'model_name',
+        'phase_deviation_days',
+        'amplitude_deviation',
+        'max_deviation',
+        'min_deviation'
+    ])
     
-    # Оранжевый цвет для максимумов модельных данных (столбцы: 8, 13, 18, ...)
-    orange_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    # Вычисляем метрики качества
+    quality_metrics = calculate_quality_metrics(extremes_data, model_extremes, num_extremes=5)
     
-    # Фиолетовый цвет для минимумов модельных данных (столбцы: 9, 14, 19, ...)
-    purple_fill = PatternFill(start_color="E4DFEC", end_color="E4DFEC", fill_type="solid")
+    # Записываем данные
+    for item in quality_metrics:
+        ws.append([
+            item['well'],
+            item['model_name'],
+            item['phase_deviation_days'],
+            item['amplitude_deviation'],
+            item['max_deviation'],
+            item['min_deviation']
+        ])
     
-    # Применяем условное форматирование ко всем ячейкам в соответствующих столбцах
-    for row in range(4, ws.max_row + 1):
-        # Сглаженные значения (столбец D)
-        cell_d = ws[f'D{row}']
-        if cell_d.value is not None:
-            cell_d.fill = green_fill
-        
-        # Максимумы сглаженных данных (столбец E)
-        cell_e = ws[f'E{row}']
-        if cell_e.value is not None:
-            cell_e.fill = red_fill
-        
-        # Минимумы сглаженных данных (столбец F)
-        cell_f = ws[f'F{row}']
-        if cell_f.value is not None:
-            cell_f.fill = blue_fill
-        
-        # Максимумы и минимумы модельных данных (для каждой модели)
-        # Первая модель начинается с колонки G (7) - wbp_model, H (8) - wbp_model_max, I (9) - wbp_model_min
-        model_col_start = 7
-        for model_idx in range(len(all_models)):
-            # Максимумы модельных данных (второй столбец для каждой модели)
-            max_col = model_col_start + model_idx * 5 + 1  # +1 потому что первый столбец модели (wbp_model) имеет индекс 0
-            if max_col <= ws.max_column:
-                max_cell = ws[f'{openpyxl.utils.get_column_letter(max_col)}{row}']
-                if max_cell.value is not None:
-                    max_cell.fill = orange_fill
-            
-            # Минимумы модельных данных (третий столбец для каждой модели)
-            min_col = model_col_start + model_idx * 5 + 2  # +2 потому что третий столбец модели - wbp_model_min
-            if min_col <= ws.max_column:
-                min_cell = ws[f'{openpyxl.utils.get_column_letter(min_col)}{row}']
-                if min_cell.value is not None:
-                    min_cell.fill = purple_fill
+    print(f"    ✓ Сохранено {len(quality_metrics)} записей о качестве соответствия")
+
+
+def save_to_excel_with_all_sheets(
+    well_dataframes: Dict[str, pd.DataFrame],
+    historical_df: pd.DataFrame,
+    models_data: Dict[str, Dict[str, Any]],
+    output_path: str = "structured_comparison_no_interpolation.xlsx"
+) -> str:
+    """
+    Сохраняет данные в Excel файл с тремя листами:
+    1. Основные данные (упрощенная версия без форматирования)
+    2. Экстремумы (последние 5 максимумов и минимумов)
+    3. Качество соответствия (метрики для каждой модели)
     
-    # Сохраняем файл
+    Parameters
+    ----------
+    well_dataframes : Dict[str, pd.DataFrame]
+        DataFrame по скважинам
+    historical_df : pd.DataFrame
+        Исторические данные
+    models_data : Dict[str, Dict[str, Any]]
+        Сырые данные моделей
+    output_path : str
+        Путь для сохранения Excel файла
+    
+    Returns
+    -------
+    str
+        Путь к сохраненному файлу
+    """
+    print(f"\nСохранение данных в Excel файл: {output_path}")
+    
+    # Сохраняем основные данные (первый лист)
+    wb, extremes_data, model_extremes = save_to_excel_structured_single_sheet(
+        well_dataframes, historical_df, models_data, output_path
+    )
+    
+    # Сохраняем данные об экстремумах (второй лист)
+    save_extremes_to_excel_sheet(wb, extremes_data, model_extremes)
+    
+    # Сохраняем метрики качества (третий лист)
+    save_quality_metrics_to_excel_sheet(wb, extremes_data, model_extremes)
+    
+    # Сохраняем файл с обновленными листами
     try:
         wb.save(output_path)
         print(f"\n✓ Файл успешно сохранен: {output_path}")
-        print(f"  Структура таблицы:")
-        print(f"    - Лист: '{ws.title}'")
-        print(f"    - Скважин: {len(well_dataframes)}")
-        print(f"    - Моделей: {len(all_models)}")
-        print(f"    - Столбцов: {ws.max_column}")
-        print(f"    - Всего строк данных: {total_rows}")
-        print(f"    - Фильтры: строки 2-3")
-        print(f"    - Закреплено: строки 1-3")
-        
-        # Выводим структуру столбцов
-        print(f"\n  Структура столбцов:")
-        print(f"    1. well - имя скважины")
-        print(f"    2. date - дата")
-        print(f"    3. wbp_hist - историческое давление")
-        print(f"    4. wbp_hist_smoothed - сглаженное историческое давление (зеленый фон)")
-        print(f"    5. wbp_hist_smoothed_max - максимумы сглаженного давления (красный фон)")
-        print(f"    6. wbp_hist_smoothed_min - минимумы сглаженного давления (синий фон)")
-        col_idx = 7
-        for i, model in enumerate(all_models):
-            print(f"    {col_idx}. {model}_wbp - давление модели {model}")
-            print(f"    {col_idx+1}. {model}_wbp_max - максимумы давления модели {model} (оранжевый фон)")
-            print(f"    {col_idx+2}. {model}_wbp_min - минимумы давления модели {model} (фиолетовый фон)")
-            print(f"    {col_idx+3}. {model}_wgpr - добыча газа модели {model}")
-            print(f"    {col_idx+4}. {model}_wgir - закачка газа модели {model}")
-            col_idx += 5
-        
-        # Проверяем, есть ли экстремумы в файле - более детальная проверка
-        print(f"\n  Проверка экстремумов в файле:")
-        smoothed_maxima_count = 0
-        smoothed_minima_count = 0
-        model_maxima_count = 0
-        model_minima_count = 0
-        
-        for row in range(4, min(ws.max_row + 1, 200)):  # Проверяем первые 200 строк данных
-            # Сглаженные экстремумы
-            smoothed_max_cell = ws[f'E{row}']
-            smoothed_min_cell = ws[f'F{row}']
-            
-            if smoothed_max_cell.value is not None:
-                smoothed_maxima_count += 1
-                if smoothed_maxima_count <= 3:  # Выводим первые 3 максимума
-                    well_name = ws[f'A{row}'].value
-                    date_val = ws[f'B{row}'].value
-                    print(f"    Сглаженный максимум строка {row}: {well_name}, {date_val} -> {smoothed_max_cell.value:.2f}")
-            
-            if smoothed_min_cell.value is not None:
-                smoothed_minima_count += 1
-                if smoothed_minima_count <= 3:  # Выводим первые 3 минимума
-                    well_name = ws[f'A{row}'].value
-                    date_val = ws[f'B{row}'].value
-                    print(f"    Сглаженный минимум строка {row}: {well_name}, {date_val} -> {smoothed_min_cell.value:.2f}")
-            
-            # Модельные экстремумы
-            for model_idx in range(len(all_models)):
-                max_col = 7 + model_idx * 5 + 1  # Столбец с максимумами модели
-                min_col = 7 + model_idx * 5 + 2  # Столбец с минимумами модели
-                
-                if max_col <= ws.max_column:
-                    model_max_cell = ws[f'{openpyxl.utils.get_column_letter(max_col)}{row}']
-                    if model_max_cell.value is not None:
-                        model_maxima_count += 1
-                        if model_maxima_count <= 5:  # Выводим первые 5 максимумов моделей
-                            well_name = ws[f'A{row}'].value
-                            date_val = ws[f'B{row}'].value
-                            model_name = all_models[model_idx]
-                            print(f"    Максимум модели {model_name} строка {row}: {well_name}, {date_val} -> {model_max_cell.value:.2f}")
-                
-                if min_col <= ws.max_column:
-                    model_min_cell = ws[f'{openpyxl.utils.get_column_letter(min_col)}{row}']
-                    if model_min_cell.value is not None:
-                        model_minima_count += 1
-                        if model_minima_count <= 5:  # Выводим первые 5 минимумов моделей
-                            well_name = ws[f'A{row}'].value
-                            date_val = ws[f'B{row}'].value
-                            model_name = all_models[model_idx]
-                            print(f"    Минимум модели {model_name} строка {row}: {well_name}, {date_val} -> {model_min_cell.value:.2f}")
-        
-        print(f"\n    Сводная статистика по экстремумам:")
-        print(f"    Всего сглаженных максимумов в первых {min(ws.max_row - 3, 200)} строках: {smoothed_maxima_count}")
-        print(f"    Всего сглаженных минимумов в первых {min(ws.max_row - 3, 200)} строках: {smoothed_minima_count}")
-        print(f"    Всего модельных максимумов в первых {min(ws.max_row - 3, 200)} строках: {model_maxima_count}")
-        print(f"    Всего модельных минимумов в первых {min(ws.max_row - 3, 200)} строках: {model_minima_count}")
-        
+        print(f"  Листы: 1. Все скважины, 2. Экстремумы, 3. Качество соответствия")
     except Exception as e:
         print(f"✗ Ошибка при сохранении файла: {e}")
         import traceback
         traceback.print_exc()
     
     return output_path
+
 
 def main() -> Optional[Dict[str, Any]]:
     """
@@ -1925,11 +2052,11 @@ def main() -> Optional[Dict[str, Any]]:
         
         print(f"\nСтатистика: {total_records} записей, {len(well_dataframes)} скважин")
         
-        # 4. Сохраняем данные в Excel с указанной структурой
+        # 4. Сохраняем данные в Excel с тремя листами
         output_excel: str = os.path.join(
             PROJECT_FOLDER_PATH, "structured_comparison_no_interpolation.xlsx"
         )
-        save_to_excel_structured_single_sheet(well_dataframes, df_fact, models_raw, output_excel)
+        save_to_excel_with_all_sheets(well_dataframes, df_fact, models_raw, output_excel)
         
         # Возвращаем данные для дальнейшего использования
         return {
