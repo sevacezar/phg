@@ -821,9 +821,27 @@ def find_extremes_improved_v2(
                         semi_annual_extremes.append((h2_min_idx, 'min', h2_min_val))
     
     # 3. Проверка краевых точек
+    # ============================================================================
+    # БУФЕР ДЛЯ ОБРАБОТКИ КРАЕВЫХ ДАННЫХ (EDGE_BUFFER_DAYS):
+    # 
+    # Проблема: стандартные алгоритмы поиска экстремумов (find_peaks) могут
+    # пропускать экстремумы в начале и конце временного ряда, так как у них
+    # недостаточно соседних точек для проверки локальности.
+    #
+    # Решение: используем специальную обработку для краевых областей:
+    # 1. edge_buffer_days (по умолчанию 30 дней) определяет размер буфера
+    # 2. Конвертируем дни в количество точек: edge_points = edge_buffer_days / avg_days_between_points
+    # 3. Для начала данных: анализируем окно pressures[:edge_points*2]
+    # 4. Для конца данных: анализируем окно pressures[-edge_points*2:]
+    # 5. В каждом окне ищем максимум и минимум
+    # 6. Для последних точек (особенно самой последней) используем более мягкие критерии:
+    #    - Порог значимости снижается до 20-40% от стандартного
+    #    - Проверяем только локальность относительно соседних точек
+    # 7. Это позволяет учитывать экстремумы в точках типа 2025-02-27 (последняя точка)
+    # ============================================================================
     edge_extremes = []
     
-    # Проверяем первые edge_buffer_days дней
+    # Конвертируем размер буфера из дней в количество точек
     edge_points = int(edge_buffer_days / avg_days_between_points) if avg_days_between_points > 0 else 30
     edge_points = min(edge_points, n//4)
     
@@ -836,13 +854,28 @@ def find_extremes_improved_v2(
             start_min_idx = np.argmin(start_window)
             start_min_val = start_window[start_min_idx]
             
-            # Проверяем значимость
-            if start_max_idx > 0 and start_max_idx < len(start_window)-1:
-                if start_max_val - start_min_val > min_prominence:
-                    edge_extremes.append((start_max_idx, 'max', start_max_val))
-                    edge_extremes.append((start_min_idx, 'min', start_min_val))
+            # Проверяем значимость (более мягкое условие для краевых точек)
+            # Для начала данных: экстремум не должен быть самой первой точкой
+            if start_max_idx > 0:
+                # Проверяем, что это локальный максимум (больше соседних точек)
+                if start_max_idx < len(start_window) - 1:
+                    # Не на краю окна - стандартная проверка
+                    if start_max_val - start_min_val > min_prominence * 0.7:  # Более мягкий порог
+                        edge_extremes.append((start_max_idx, 'max', start_max_val))
+                elif start_max_val > pressures[start_max_idx + 1] if start_max_idx + 1 < n else False:
+                    # На краю окна, но все равно локальный максимум
+                    if start_max_val - start_min_val > min_prominence * 0.5:  # Еще более мягкий порог
+                        edge_extremes.append((start_max_idx, 'max', start_max_val))
+            
+            if start_min_idx > 0:
+                if start_min_idx < len(start_window) - 1:
+                    if start_max_val - start_min_val > min_prominence * 0.7:
+                        edge_extremes.append((start_min_idx, 'min', start_min_val))
+                elif start_min_val < pressures[start_min_idx + 1] if start_min_idx + 1 < n else False:
+                    if start_max_val - start_min_val > min_prominence * 0.5:
+                        edge_extremes.append((start_min_idx, 'min', start_min_val))
         
-        # Проверяем конец данных
+        # Проверяем конец данных (улучшенная логика для последних точек)
         end_window = pressures[-edge_points*2:]
         if len(end_window) > 0:
             end_max_idx = n - len(end_window) + np.argmax(end_window)
@@ -850,10 +883,65 @@ def find_extremes_improved_v2(
             end_min_idx = n - len(end_window) + np.argmin(end_window)
             end_min_val = pressures[end_min_idx]
             
-            if end_max_idx > n - len(end_window) and end_max_idx < n-1:
-                if end_max_val - end_min_val > min_prominence:
-                    edge_extremes.append((end_max_idx, 'max', end_max_val))
-                    edge_extremes.append((end_min_idx, 'min', end_min_val))
+            # Специальная обработка для самой последней точки (индекс n-1)
+            # Если последняя точка является экстремумом в окне, она должна учитываться
+            if end_max_idx == n - 1:
+                # Последняя точка - максимум в окне
+                # Проверяем, что она больше предыдущей точки (локальный максимум)
+                if n > 1 and end_max_val >= pressures[n - 2]:
+                    # Используем очень мягкий порог для последней точки
+                    if end_max_val - end_min_val > min_prominence * 0.2:
+                        edge_extremes.append((end_max_idx, 'max', end_max_val))
+            
+            if end_min_idx == n - 1:
+                # Последняя точка - минимум в окне
+                if n > 1 and end_min_val <= pressures[n - 2]:
+                    if end_max_val - end_min_val > min_prominence * 0.2:
+                        edge_extremes.append((end_min_idx, 'min', end_min_val))
+            
+            # Более гибкая проверка для других точек в конце данных
+            # Проверяем, что это локальный экстремум относительно соседних точек
+            if end_max_idx != n - 1:  # Если это не последняя точка
+                is_max_local = True
+                
+                # Для максимума: проверяем, что он больше соседних точек
+                if end_max_idx > 0:
+                    is_max_local = is_max_local and (end_max_val >= pressures[end_max_idx - 1])
+                if end_max_idx < n - 1:
+                    is_max_local = is_max_local and (end_max_val >= pressures[end_max_idx + 1])
+                
+                # Добавляем экстремум, если он локальный и значимый
+                if is_max_local:
+                    # Для предпоследней точки используем более мягкий порог
+                    if end_max_idx >= n - 2:
+                        prominence_threshold = min_prominence * 0.4
+                    elif end_max_idx >= n - edge_points:
+                        prominence_threshold = min_prominence * 0.6
+                    else:
+                        prominence_threshold = min_prominence * 0.7
+                    
+                    if end_max_val - end_min_val > prominence_threshold:
+                        edge_extremes.append((end_max_idx, 'max', end_max_val))
+            
+            if end_min_idx != n - 1:  # Если это не последняя точка
+                is_min_local = True
+                
+                # Для минимума: проверяем, что он меньше соседних точек
+                if end_min_idx > 0:
+                    is_min_local = is_min_local and (end_min_val <= pressures[end_min_idx - 1])
+                if end_min_idx < n - 1:
+                    is_min_local = is_min_local and (end_min_val <= pressures[end_min_idx + 1])
+                
+                if is_min_local:
+                    if end_min_idx >= n - 2:
+                        prominence_threshold = min_prominence * 0.4
+                    elif end_min_idx >= n - edge_points:
+                        prominence_threshold = min_prominence * 0.6
+                    else:
+                        prominence_threshold = min_prominence * 0.7
+                    
+                    if end_max_val - end_min_val > prominence_threshold:
+                        edge_extremes.append((end_min_idx, 'min', end_min_val))
     
     # 4. Объединяем все найденные экстремумы
     all_extrema_dict: Dict[str, List[Tuple[int, float]]] = {'max': [], 'min': []}
