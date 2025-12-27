@@ -2161,7 +2161,22 @@ def prepare_graph_data(
     -------
     List[Dict[str, Any]]
         Список словарей с данными для каждой скважины в формате для сервера
+        Включает метрики качества для каждой модели
     """
+    # Вычисляем метрики качества для всех скважин и моделей
+    quality_metrics = calculate_quality_metrics(extremes_data, model_extremes, num_extremes=num_extremes)
+    
+    # Создаем словарь для быстрого доступа к метрикам: (well_name, model_name) -> metrics
+    metrics_dict: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for metric in quality_metrics:
+        key = (metric['well'], metric['model_name'])
+        metrics_dict[key] = {
+            'phase_deviation_days': metric.get('phase_deviation_days'),
+            'amplitude_deviation': metric.get('amplitude_deviation'),
+            'max_deviation': metric.get('max_deviation'),
+            'min_deviation': metric.get('min_deviation')
+        }
+    
     result: List[Dict[str, Any]] = []
     
     # Получаем все скважины
@@ -2326,6 +2341,21 @@ def prepare_graph_data(
                                 'type': 'min'
                             })
         
+        # Добавляем метрики качества для каждой модели
+        if well_name in model_extremes:
+            well_data['quality_metrics'] = {}
+            for model_name in model_extremes[well_name].keys():
+                metrics_key = (well_name, model_name)
+                if metrics_key in metrics_dict:
+                    well_data['quality_metrics'][model_name] = metrics_dict[metrics_key]
+                else:
+                    well_data['quality_metrics'][model_name] = {
+                        'phase_deviation_days': None,
+                        'amplitude_deviation': None,
+                        'max_deviation': None,
+                        'min_deviation': None
+                    }
+        
         result.append(well_data)
     
     return result
@@ -2360,16 +2390,47 @@ def send_graph_request_and_save_archive(
     try:
         # Подготавливаем данные
         print("  Подготовка данных...")
-        graph_data = prepare_graph_data(well_dataframes, extremes_data, model_extremes, num_extremes=5)
+        graph_data_raw = prepare_graph_data(well_dataframes, extremes_data, model_extremes, num_extremes=5)
         
-        if not graph_data:
+        if not graph_data_raw:
             print("  Предупреждение: нет данных для отправки")
             return None
         
-        print(f"  Подготовлено данных для {len(graph_data)} скважин")
+        print(f"  Подготовлено данных для {len(graph_data_raw)} скважин")
+        
+        # Преобразуем данные в формат для API
+        # Структура: {"wells": [{"well_name": "...", "fact": {...}, "models": {...}, "quality_metrics": {...}}, ...]}
+        api_data = {"wells": []}
+        
+        for well_dict in graph_data_raw:
+            well_name = well_dict['well_name']
+            
+            # Преобразуем структуру данных
+            well_api_data = {
+                "well_name": well_name,
+                "fact": {
+                    "dates": well_dict['fact']['dates'],
+                    "wbp": well_dict['fact']['wbp'],
+                    "extremums": well_dict['fact']['extremums']
+                },
+                "models": {},
+                "quality_metrics": well_dict.get('quality_metrics', {})
+            }
+            
+            # Преобразуем модели из плоской структуры в словарь
+            for key, value in well_dict.items():
+                if key not in ['well_name', 'fact', 'quality_metrics']:
+                    # Это название модели
+                    well_api_data["models"][key] = {
+                        "dates": value['dates'],
+                        "wbp": value['wbp'],
+                        "extremums": value['extremums']
+                    }
+            
+            api_data["wells"].append(well_api_data)
         
         # Формируем JSON
-        json_data = json.dumps(graph_data, ensure_ascii=False, indent=2)
+        json_data = json.dumps(api_data, ensure_ascii=False, indent=2)
         
         # Создаем соединение
         conn = http.client.HTTPConnection(GRAPH_SERVER_HOST, GRAPH_SERVER_PORT)
