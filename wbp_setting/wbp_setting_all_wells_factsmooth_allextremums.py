@@ -19,7 +19,8 @@ from openpyxl import Workbook
 
 # ============================================================================
 # БЛОК, ЗАПОЛНЯЕМЫЙ ПОЛЬЗОВАТЕЛЕМ
-WBP_FACT_TXT: str = "scripts_data/Pfkt0.inc"  # Относительный путь до файла с фактическими давлениями
+WBP_FACT_TXT: str = "wbp_adapt/Pfkt0_156.inc"  # Относительный путь (относительно DATA-файла модели) до файла с фактическими давлениями
+OUTPUT_EXCEL_FILE: str = "wbp_adapt/res/model-fact-wbp-comparison.xlsx" # Относительный путь (относительно DATA-файла модели) до результируещего файла с давлениями
 MODEL_NAMES: list[str] = [
     "Hist_L0_adapt_GC_AQ_bz_YAMB_SWL_new_swl1.2",
 ]
@@ -45,11 +46,11 @@ MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки кра�
 MODEL_EXCLUDE_END_DAYS: int = 70  # Количество дней с конца периода, в которых экстремумы будут исключены для моделей
 
 # Настройки сервера для построения графиков
-CREATE_GRAPHS: bool = False
+CREATE_GRAPHS: bool = True
 GRAPH_SERVER_HOST: str = "10.7.115.8"  # Хост сервера
 GRAPH_SERVER_PORT: int = 5000  # Порт сервера
 GRAPH_SERVER_ENDPOINT: str = "/adapt_wbp_phg"  # Эндпойнт для запроса графиков
-GRAPH_ARCHIVE_NAME: str = "graphs_archive.zip"  # Имя архива с графиками для сохранения
+GRAPH_ARCHIVE_NAME: str = "wbp_adapt/res/graphs_archive.zip"  # Имя архива с графиками для сохранения
 
 PROJECT_FOLDER_PATH: str = get_project_folder()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ПУТЬ К ПРОЕКТУ (пример - I:/L/phg/RedGift_USG)
 
@@ -1754,7 +1755,7 @@ def calculate_quality_metrics(
 
 
 def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models_data, 
-                                        output_path="structured_comparison_single_sheet.xlsx"):
+                                        output_path=OUTPUT_EXCEL_FILE):
     """
     Сохранить данные в Excel файл на один лист с указанной структурой в виде единой таблицы:
     1 строка: well, date, wbp_hist, wbp_hist_smoothed, wbp_hist_smoothed_max, wbp_hist_smoothed_min, 
@@ -2087,7 +2088,7 @@ def save_to_excel_with_all_sheets(
     well_dataframes: Dict[str, pd.DataFrame],
     historical_df: pd.DataFrame,
     models_data: Dict[str, Dict[str, Any]],
-    output_path: str = "structured_comparison_no_interpolation.xlsx"
+    output_path: str = OUTPUT_EXCEL_FILE
 ) -> str:
     """
     Сохраняет данные в Excel файл с тремя листами:
@@ -2551,7 +2552,7 @@ def main() -> Optional[Dict[str, Any]]:
         
         # 4. Сохраняем данные в Excel с тремя листами
         output_excel: str = os.path.join(
-            PROJECT_FOLDER_PATH, "structured_comparison_no_interpolation.xlsx"
+            PROJECT_FOLDER_PATH, OUTPUT_EXCEL_FILE
         )
         output_excel, extremes_data, model_extremes = save_to_excel_with_all_sheets(
             well_dataframes, df_fact, models_raw, output_excel
