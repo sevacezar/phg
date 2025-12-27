@@ -1974,6 +1974,11 @@ def save_to_excel_structured_single_sheet(well_dataframes, historical_df, models
     
     total_rows = len(all_rows)
     
+    # Создаем директорию, если её нет
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
     # Сохраняем файл (без форматирования для ускорения)
     try:
         wb.save(output_path)
@@ -2124,6 +2129,11 @@ def save_to_excel_with_all_sheets(
     
     # Сохраняем метрики качества (третий лист)
     save_quality_metrics_to_excel_sheet(wb, extremes_data, model_extremes)
+    
+    # Создаем директорию, если её нет
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
     
     # Сохраняем файл с обновленными листами
     try:
@@ -2464,6 +2474,11 @@ def send_graph_request_and_save_archive(
         # Сохраняем архив
         archive_path = os.path.join(PROJECT_FOLDER_PATH, GRAPH_ARCHIVE_NAME)
         print(f"  Сохранение архива: {archive_path}")
+        
+        # Создаем директорию, если её нет
+        archive_dir = os.path.dirname(archive_path)
+        if archive_dir and not os.path.exists(archive_dir):
+            os.makedirs(archive_dir, exist_ok=True)
         
         with open(archive_path, 'wb') as f:
             f.write(archive_data)
