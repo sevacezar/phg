@@ -213,7 +213,7 @@ def create_graph(
             fact_max_values,
             color=FACT_COLORS['max'],
             marker='^',
-            s=80,
+            s=40,
             alpha=0.8,
             label='Факт (максимумы)',
             edgecolors='darkgreen',
@@ -230,7 +230,7 @@ def create_graph(
             fact_min_values,
             color=FACT_COLORS['min'],
             marker='v',
-            s=80,
+            s=40,
             alpha=0.8,
             label='Факт (минимумы)',
             edgecolors='darkred',
@@ -259,7 +259,7 @@ def create_graph(
             model_max_values,
             color=MODEL_COLORS['max'],
             marker='^',
-            s=80,
+            s=40,
             alpha=0.8,
             label=f'{model_name} (максимумы)',
             edgecolors='darkviolet',
@@ -276,7 +276,7 @@ def create_graph(
             model_min_values,
             color=MODEL_COLORS['min'],
             marker='v',
-            s=80,
+            s=40,
             alpha=0.8,
             label=f'{model_name} (минимумы)',
             edgecolors='saddlebrown',
@@ -289,7 +289,7 @@ def create_graph(
     ax.set_ylim(pressure_limits)
     
     # Настройка осей
-    ax.set_xlabel('Дата', fontsize=12, fontweight='bold')
+    # Убираем подпись оси X, чтобы не перекрывалась с легендой
     ax.set_ylabel('Пластовое давление, бар', fontsize=12, fontweight='bold')
     
     # Заголовок
