@@ -301,36 +301,125 @@ def create_graph(
     ax.set_axisbelow(True)
     
     # Настройка формата дат на оси X
-    # Используем более частый locator, чтобы показывать подписи у каждой линии сетки
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     
-    # Вычисляем количество дней в диапазоне для настройки частоты подписей
+    # Вычисляем количество дней в диапазоне для оптимизации частоты подписей
     date_range_days = (date_limits[1] - date_limits[0]).days
-    # Показываем подписи у каждой линии сетки (примерно каждые 30-60 дней в зависимости от диапазона)
-    if date_range_days > 1000:
+    
+    # Адаптивно выбираем интервал подписей в зависимости от диапазона дат
+    # чтобы избежать перекрытия, но показывать достаточно часто
+    if date_range_days > 2000:
+        # Для очень больших диапазонов - реже
+        tick_interval_days = 120
+        max_ticks = 12
+    elif date_range_days > 1000:
         tick_interval_days = 60
+        max_ticks = 15
     elif date_range_days > 500:
         tick_interval_days = 30
-    else:
+        max_ticks = 18
+    elif date_range_days > 200:
         tick_interval_days = 15
+        max_ticks = 20
+    else:
+        # Для небольших диапазонов - чаще, но не слишком
+        tick_interval_days = 7
+        max_ticks = 25
     
-    # Создаем locator с нужным интервалом
+    # Используем DayLocator с вычисленным интервалом
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=tick_interval_days))
+    
+    # Ограничиваем максимальное количество подписей, чтобы избежать перекрытия
+    # Если тиков слишком много, увеличиваем интервал
+    current_ticks = len(ax.xaxis.get_major_ticks())
+    if current_ticks > max_ticks:
+        # Увеличиваем интервал, чтобы уложиться в лимит
+        adjusted_interval = int(date_range_days / max_ticks)
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=adjusted_interval))
+    
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
-    # Настройка сетки по датам (вспомогательные линии)
-    ax.xaxis.set_minor_locator(mdates.DayLocator(interval=max(1, tick_interval_days // 2)))
+    # Настройка сетки по датам (вспомогательные линии - без подписей)
+    # Используем более частые линии для сетки, но без подписей
+    ax.xaxis.set_minor_locator(mdates.DayLocator(interval=max(1, tick_interval_days // 3)))
     ax.grid(True, which='minor', alpha=0.2, linestyle=':', linewidth=0.5)
     
-    # Легенда под графиком (под осью X)
+    # Создаем легенду с двумя столбцами: факты слева, модели справа
+    # Собираем все handles и labels в правильном порядке для двух столбцов
+    all_handles = []
+    all_labels = []
+    
+    # Первый столбец: факты (3 ряда)
+    if fact_dates and fact_pressures:
+        all_handles.append(plt.Line2D([0], [0], marker='o', color='w', 
+                                     markerfacecolor=FACT_COLORS['data'], 
+                                     markersize=8, alpha=0.6))
+        all_labels.append('Факт (давление)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    if fact_maxima:
+        all_handles.append(plt.Line2D([0], [0], marker='^', color='w', 
+                                     markerfacecolor=FACT_COLORS['max'], 
+                                     markeredgecolor='darkgreen',
+                                     markersize=10, markeredgewidth=1.0))
+        all_labels.append('Факт (максимумы)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    if fact_minima:
+        all_handles.append(plt.Line2D([0], [0], marker='v', color='w', 
+                                     markerfacecolor=FACT_COLORS['min'], 
+                                     markeredgecolor='darkred',
+                                     markersize=10, markeredgewidth=1.0))
+        all_labels.append('Факт (минимумы)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    # Второй столбец: модель (3 ряда)
+    if model_dates and model_pressures:
+        all_handles.append(plt.Line2D([0], [0], color=MODEL_COLORS['data'], 
+                                     linewidth=2, alpha=0.8))
+        all_labels.append(f'{model_name} (давление)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    if model_maxima:
+        all_handles.append(plt.Line2D([0], [0], marker='^', color='w', 
+                                     markerfacecolor=MODEL_COLORS['max'], 
+                                     markeredgecolor='darkviolet',
+                                     markersize=10, markeredgewidth=1.0))
+        all_labels.append(f'{model_name} (максимумы)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    if model_minima:
+        all_handles.append(plt.Line2D([0], [0], marker='v', color='w', 
+                                     markerfacecolor=MODEL_COLORS['min'], 
+                                     markeredgecolor='saddlebrown',
+                                     markersize=10, markeredgewidth=1.0))
+        all_labels.append(f'{model_name} (минимумы)')
+    else:
+        all_handles.append(plt.Line2D([0], [0], visible=False))
+        all_labels.append('')
+    
+    # Создаем легенду с двумя столбцами (ncol=2) и тремя рядами
     legend = ax.legend(
+        all_handles, all_labels,
         loc='upper center',
         bbox_to_anchor=(0.5, -0.15),
-        ncol=4,
+        ncol=2,  # Два столбца
         fontsize=9,
-        framealpha=0.9,
-        fancybox=True,
-        shadow=True
+        frameon=False,  # Убираем рамку
+        facecolor='white',  # Белый фон
+        edgecolor='none',
+        columnspacing=1.5,  # Расстояние между столбцами
+        handletextpad=0.5  # Расстояние между маркером и текстом
     )
     
     # Добавляем метрики качества в текстовое поле
