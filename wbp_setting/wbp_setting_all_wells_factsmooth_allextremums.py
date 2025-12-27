@@ -45,6 +45,7 @@ MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки кра�
 MODEL_EXCLUDE_END_DAYS: int = 60  # Количество дней с конца периода, в которых экстремумы будут исключены для моделей
 
 # Настройки сервера для построения графиков
+CREATE_GRAPHS: bool = False
 GRAPH_SERVER_HOST: str = "localhost"  # Хост сервера
 GRAPH_SERVER_PORT: int = 8000  # Порт сервера
 GRAPH_SERVER_ENDPOINT: str = "/api/generate_graphs"  # Эндпойнт для запроса графиков
@@ -2365,9 +2366,11 @@ def main() -> Optional[Dict[str, Any]]:
         )
         
         # 5. Отправляем данные на сервер для построения графиков
-        archive_path = send_graph_request_and_save_archive(
-            well_dataframes, extremes_data, model_extremes
-        )
+        archive_path: str | None = None
+        if CREATE_GRAPHS:
+            archive_path = send_graph_request_and_save_archive(
+                well_dataframes, extremes_data, model_extremes
+            )
         
         # Возвращаем данные для дальнейшего использования
         result = {
@@ -2396,7 +2399,7 @@ def main() -> Optional[Dict[str, Any]]:
 
 
 # БЛОК ВЫПОЛНЕНИЯ СКРИПТА
-if __name__ == "__main__":
+if True:
     result_data: Optional[Dict[str, Any]] = main()
     if result_data:
         print("\n" + "=" * 80)
