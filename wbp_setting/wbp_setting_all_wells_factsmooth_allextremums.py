@@ -34,13 +34,15 @@ MIN_POINTS_FOR_SMOOTHING: int = 5  # Минимальное количество
 MIN_DISTANCE_DAYS: int = 60  # Минимальное расстояние между экстремумами в днях
 PROMINENCE_PERCENT: float = 2.0  # Минимальная значимость экстремума в процентах от среднего значения
 MAX_CYCLE_DAYS: int = 400  # Максимальная длина цикла в днях
-EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях
+EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях (используется для поиска экстремумов в начале и конце)
+EXCLUDE_END_DAYS: int = 60  # Количество дней с конца периода, в которых экстремумы будут исключены (для корректного сопоставления факта и моделей)
 
 # Настройки поиска экстремумов для модельных данных (более чувствительные)
 MODEL_MIN_DISTANCE_DAYS: int = 45  # Минимальное расстояние между экстремумами в днях для моделей
 MODEL_PROMINENCE_PERCENT: float = 1.0  # Минимальная значимость экстремума в процентах для моделей (более чувствительно)
 MODEL_MAX_CYCLE_DAYS: int = 400  # Максимальная длина цикла в днях для моделей
-MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях для моделей
+MODEL_EDGE_BUFFER_DAYS: int = 30  # Буфер для обработки краев данных в днях для моделей (используется для поиска экстремумов в начале и конце)
+MODEL_EXCLUDE_END_DAYS: int = 60  # Количество дней с конца периода, в которых экстремумы будут исключены для моделей
 
 # Настройки сервера для построения графиков
 GRAPH_SERVER_HOST: str = "localhost"  # Хост сервера
@@ -627,7 +629,8 @@ def find_extremes_improved_v2(
     min_distance_days: int = MIN_DISTANCE_DAYS,
     prominence_percent: float = PROMINENCE_PERCENT,
     max_cycle_days: int = MAX_CYCLE_DAYS,
-    edge_buffer_days: int = EDGE_BUFFER_DAYS
+    edge_buffer_days: int = EDGE_BUFFER_DAYS,
+    exclude_end_days: int = 0
 ) -> pd.DataFrame:
     """
     Улучшенный алгоритм поиска экстремумов для циклических данных с годовыми циклами.
@@ -644,6 +647,10 @@ def find_extremes_improved_v2(
         Максимальная длина цикла в днях (по умолчанию 400)
     edge_buffer_days : int
         Буфер для обработки краев данных в днях (по умолчанию 30)
+    exclude_end_days : int
+        Количество дней с конца периода, в которых экстремумы будут исключены (по умолчанию 0)
+        Используется для корректного сопоставления факта и моделей, когда в конце периода
+        экстремумы могут быть определены только в одной из серий
     
     Returns
     -------
@@ -1020,6 +1027,19 @@ def find_extremes_improved_v2(
     filtered_maxima: List[int] = sorted(list(set(filtered_maxima)))
     filtered_minima: List[int] = sorted(list(set(filtered_minima)))
     
+    # 7.5. Исключаем экстремумы в конце периода (если указано)
+    if exclude_end_days > 0 and n > 1:
+        # Вычисляем дату, до которой нужно исключить экстремумы
+        exclude_end_date = dates[-1] - pd.Timedelta(days=exclude_end_days)
+        
+        # Находим индекс последней даты, которая меньше exclude_end_date
+        # Используем бинарный поиск для эффективности
+        exclude_end_idx = np.searchsorted(dates, exclude_end_date, side='right')
+        
+        # Фильтруем экстремумы, которые находятся после exclude_end_idx
+        filtered_maxima = [idx for idx in filtered_maxima if idx < exclude_end_idx]
+        filtered_minima = [idx for idx in filtered_minima if idx < exclude_end_idx]
+    
     # 8. Заполняем датафрейм
     for idx in filtered_maxima:
         if 0 <= idx < n:
@@ -1144,7 +1164,10 @@ def compute_smoothed_pressures_and_extremes(
             smoothed_df: pd.DataFrame = smooth_pressure_timeseries(pressure_df)
             
             # Поиск экстремумов в сглаженных данных
-            extremes_df: pd.DataFrame = find_extremes_improved_v2(smoothed_df)
+            extremes_df: pd.DataFrame = find_extremes_improved_v2(
+                smoothed_df,
+                exclude_end_days=EXCLUDE_END_DAYS
+            )
             
             # Создаем словарь для быстрого доступа к сглаженным значениям по дате (vectorized)
             def normalize_date_key(date_val):
@@ -1283,7 +1306,8 @@ def compute_model_extremes(
                     min_distance_days=MODEL_MIN_DISTANCE_DAYS,
                     prominence_percent=MODEL_PROMINENCE_PERCENT,
                     max_cycle_days=MODEL_MAX_CYCLE_DAYS,
-                    edge_buffer_days=MODEL_EDGE_BUFFER_DAYS
+                    edge_buffer_days=MODEL_EDGE_BUFFER_DAYS,
+                    exclude_end_days=MODEL_EXCLUDE_END_DAYS
                 )
                 
                 # Создаем словари для экстремумов (vectorized)
