@@ -376,10 +376,8 @@ def generate_graphs_archive(wells_data: List[WellData]) -> io.BytesIO:
             # Создаем график для каждой модели
             for model_name, model_series in well_data.models.items():
                 # Получаем метрики качества для этой модели
-                quality_metrics_dict = well_data.quality_metrics.get(model_name)
-                quality_metrics = None
-                if quality_metrics_dict:
-                    quality_metrics = QualityMetrics(**quality_metrics_dict)
+                # Pydantic уже преобразовал словарь в объект QualityMetrics
+                quality_metrics = well_data.quality_metrics.get(model_name)
                 
                 # Создаем график
                 graph_buffer = create_graph(
