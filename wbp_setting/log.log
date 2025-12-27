@@ -1,55 +1,47 @@
 ================================================================================
 ПОЛУЧЕНИЕ УНИФИЦИРОВАННЫХ ДАННЫХ ДЛЯ СРАВНЕНИЯ
 ================================================================================
-Загрузка фактических данных из файла: I:/L/phg/RedGift_USG\scripts_data/Pfkt0.inc
-  Файл прочитан с кодировкой: cp1251
-  Загружено 11413 записей для 17 скважин
-Загружено: 11413 записей, 17 скважин
+Загрузка фактических данных из файла: I:/L/phg/RedGift_USG\scripts_data/Pfkt0_156.inc
+  Файл прочитан с кодировкой: utf-8
+  Загружено 707 записей для 1 скважин
+Загружено: 707 записей, 1 скважин
 Получение унифицированных данных по скважинам...
-  Скважин для анализа: 17
+  Скважин для анализа: 1
 Загрузка модели: Hist_L0_adapt_GC_AQ_bz_YAMB_SWL_new_swl1.2
-  Загружено: 17 скважин, пропущено: 0
+  Загружено: 1 скважин, пропущено: 0
 Итог: загружены данные из 1 моделей
-  Обработка 17 скважин...
-  Создано DataFrame для 17 скважин
-  Параметры: gas_injection(17 скв.), gas_rate(17 скв.), pressure(17 скв.)
+  Обработка 1 скважин...
+  Создано DataFrame для 1 скважин
+  Параметры: gas_injection(1 скв.), gas_rate(1 скв.), pressure(1 скв.)
 
-Статистика: 153379 записей, 17 скважин
+Статистика: 9854 записей, 1 скважин
 
-Сохранение данных в Excel файл: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation.xlsx
-  Вычисление сглаженных давлений и экстремумов для 17 скважин...
-  Ошибка при обработке скважины 97: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 99: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 129: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 18: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 70: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 63: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 25: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 110: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 156: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 53: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 47: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 46: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 57: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 24: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 157: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 142: '<' not supported between instances of 'int' and 'Timestamp'
-  Ошибка при обработке скважины 127: '<' not supported between instances of 'int' and 'Timestamp'
-  Обработано 0 скважин
+Сохранение данных в Excel файл: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation_v3.xlsx
+  Вычисление сглаженных давлений и экстремумов для 1 скважин...
+  Обработано 1 скважин
   Вычисление экстремумов для модельных давлений...
-  Добавление 47378 строк данных...
+  Добавление 3053 строк данных...
   Сохранение данных об экстремумах на лист 2...
-    ✓ Сохранено 0 записей об экстремумах
+    ✓ Сохранено 20 записей об экстремумах
   Сохранение метрик качества на лист 3...
-    ✓ Сохранено 17 записей о качестве соответствия
+    ✓ Сохранено 1 записей о качестве соответствия
 
-✓ Файл успешно сохранен: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation.xlsx
+✓ Файл успешно сохранен: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation_v3.xlsx
   Листы: 1. Все скважины, 2. Экстремумы, 3. Качество соответствия
+
+Отправка данных на сервер для построения графиков...
+  Хост: 10.7.115.8:5000
+  Эндпойнт: /adapt_wbp_phg
+  Подготовка данных...
+  Подготовлено данных для 1 скважин
+  Отправка запроса на сервер...
+  ✗ Ошибка: сервер вернул статус 500
+  Сообщение: {"detail":"Ошибка при генерации графиков: projects.adapt_wbp_phg.schemas.QualityMetrics() argument after ** must be a mapping, not QualityMetrics"}
 
 ================================================================================
 ДАННЫЕ УСПЕШНО ПОДГОТОВЛЕНЫ ДЛЯ СРАВНЕНИЯ!
 ================================================================================
-Excel файл: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation.xlsx
+Excel файл: I:/L/phg/RedGift_USG\structured_comparison_no_interpolation_v3.xlsx
 
 Выполнено!
 Нет экспортированных графиков.

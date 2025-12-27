@@ -1,7 +1,7 @@
 """
 FastAPI роутер для построения графиков.
 """
-
+import os
 from typing import List
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -9,10 +9,13 @@ from fastapi.responses import StreamingResponse
 from .schemas import GraphRequest, GraphResponse
 from .graph_maker import generate_graphs_archive
 
-router = APIRouter(prefix="/api", tags=["graphs"])
+SERVICE_NAME: str = os.path.basename(os.path.dirname(__file__))
 
 
-@router.post("/generate_graphs", response_model=GraphResponse)
+router = APIRouter(prefix="/adapt_wbp_phg", tags=[SERVICE_NAME])
+
+
+@router.post("", response_model=GraphResponse)
 async def generate_graphs(request: GraphRequest) -> StreamingResponse:
     """
     Генерирует графики сравнения факта и моделей для всех скважин.
@@ -72,21 +75,8 @@ async def generate_graphs(request: GraphRequest) -> StreamingResponse:
     except HTTPException:
         raise
     except Exception as e:
+        print(str(e))
         raise HTTPException(
             status_code=500,
             detail=f"Ошибка при генерации графиков: {str(e)}"
         )
-
-
-@router.get("/health")
-async def health_check():
-    """
-    Проверка работоспособности сервиса.
-    
-    Returns
-    -------
-    dict
-        Статус сервиса
-    """
-    return {"status": "ok", "service": "graph_maker"}
-

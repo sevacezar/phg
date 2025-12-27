@@ -46,9 +46,9 @@ MODEL_EXCLUDE_END_DAYS: int = 70  # Количество дней с конца 
 
 # Настройки сервера для построения графиков
 CREATE_GRAPHS: bool = False
-GRAPH_SERVER_HOST: str = "localhost"  # Хост сервера
-GRAPH_SERVER_PORT: int = 8000  # Порт сервера
-GRAPH_SERVER_ENDPOINT: str = "/api/generate_graphs"  # Эндпойнт для запроса графиков
+GRAPH_SERVER_HOST: str = "10.7.115.8"  # Хост сервера
+GRAPH_SERVER_PORT: int = 5000  # Порт сервера
+GRAPH_SERVER_ENDPOINT: str = "/adapt_wbp_phg"  # Эндпойнт для запроса графиков
 GRAPH_ARCHIVE_NAME: str = "graphs_archive.zip"  # Имя архива с графиками для сохранения
 
 PROJECT_FOLDER_PATH: str = get_project_folder()  # ВСТРОЕННАЯ В ИНСТРУМЕНТ ФУНКЦИЯ - ВОЗВРАЩАЕТ ПУТЬ К ПРОЕКТУ (пример - I:/L/phg/RedGift_USG)
