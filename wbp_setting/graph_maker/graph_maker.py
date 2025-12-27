@@ -213,11 +213,11 @@ def create_graph(
             fact_max_values,
             color=FACT_COLORS['max'],
             marker='^',
-            s=150,
+            s=80,
             alpha=0.8,
             label='Факт (максимумы)',
             edgecolors='darkgreen',
-            linewidths=1.5,
+            linewidths=1.0,
             zorder=5
         )
     
@@ -230,11 +230,11 @@ def create_graph(
             fact_min_values,
             color=FACT_COLORS['min'],
             marker='v',
-            s=150,
+            s=80,
             alpha=0.8,
             label='Факт (минимумы)',
             edgecolors='darkred',
-            linewidths=1.5,
+            linewidths=1.0,
             zorder=5
         )
     
@@ -259,11 +259,11 @@ def create_graph(
             model_max_values,
             color=MODEL_COLORS['max'],
             marker='^',
-            s=150,
+            s=80,
             alpha=0.8,
             label=f'{model_name} (максимумы)',
             edgecolors='darkviolet',
-            linewidths=1.5,
+            linewidths=1.0,
             zorder=4
         )
     
@@ -276,11 +276,11 @@ def create_graph(
             model_min_values,
             color=MODEL_COLORS['min'],
             marker='v',
-            s=150,
+            s=80,
             alpha=0.8,
             label=f'{model_name} (минимумы)',
             edgecolors='saddlebrown',
-            linewidths=1.5,
+            linewidths=1.0,
             zorder=4
         )
     
@@ -301,18 +301,33 @@ def create_graph(
     ax.set_axisbelow(True)
     
     # Настройка формата дат на оси X
+    # Используем более частый locator, чтобы показывать подписи у каждой линии сетки
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
+    
+    # Вычисляем количество дней в диапазоне для настройки частоты подписей
+    date_range_days = (date_limits[1] - date_limits[0]).days
+    # Показываем подписи у каждой линии сетки (примерно каждые 30-60 дней в зависимости от диапазона)
+    if date_range_days > 1000:
+        tick_interval_days = 60
+    elif date_range_days > 500:
+        tick_interval_days = 30
+    else:
+        tick_interval_days = 15
+    
+    # Создаем locator с нужным интервалом
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=tick_interval_days))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
     
-    # Настройка сетки по датам
-    ax.xaxis.set_minor_locator(mdates.AutoDateLocator(minticks=10, maxticks=20))
+    # Настройка сетки по датам (вспомогательные линии)
+    ax.xaxis.set_minor_locator(mdates.DayLocator(interval=max(1, tick_interval_days // 2)))
     ax.grid(True, which='minor', alpha=0.2, linestyle=':', linewidth=0.5)
     
-    # Легенда
+    # Легенда под графиком (под осью X)
     legend = ax.legend(
-        loc='upper left',
-        fontsize=10,
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.15),
+        ncol=4,
+        fontsize=9,
         framealpha=0.9,
         fancybox=True,
         shadow=True
@@ -338,8 +353,8 @@ def create_graph(
             bbox=props
         )
     
-    # Улучшаем компоновку
-    plt.tight_layout()
+    # Улучшаем компоновку с учетом легенды под графиком
+    plt.tight_layout(rect=[0, 0.05, 1, 0.98])
     
     # Сохраняем в буфер
     buf = io.BytesIO()
