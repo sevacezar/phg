@@ -1030,16 +1030,26 @@ def find_extremes_improved_v2(
     
     # 7.5. Исключаем экстремумы в конце периода (если указано)
     if exclude_end_days > 0 and n > 1:
-        # Вычисляем дату, до которой нужно исключить экстремумы
-        exclude_end_date = dates[-1] - pd.Timedelta(days=exclude_end_days)
-        
-        # Находим индекс последней даты, которая меньше exclude_end_date
-        # Используем бинарный поиск для эффективности
-        exclude_end_idx = np.searchsorted(dates, exclude_end_date, side='right')
-        
-        # Фильтруем экстремумы, которые находятся после exclude_end_idx
-        filtered_maxima = [idx for idx in filtered_maxima if idx < exclude_end_idx]
-        filtered_minima = [idx for idx in filtered_minima if idx < exclude_end_idx]
+        try:
+            # Вычисляем дату, до которой нужно исключить экстремумы
+            # Преобразуем dates[-1] в pandas Timestamp для корректной работы
+            last_date = pd.Timestamp(dates[-1]) if not isinstance(dates[-1], pd.Timestamp) else dates[-1]
+            exclude_end_date = last_date - pd.Timedelta(days=exclude_end_days)
+            
+            # Находим индекс последней даты, которая меньше exclude_end_date
+            # Используем pandas Series для корректного сравнения дат
+            date_series = pd.Series(dates)
+            exclude_end_idx = int((date_series <= exclude_end_date).sum())
+            
+            # Убеждаемся, что exclude_end_idx в допустимых пределах
+            exclude_end_idx = min(exclude_end_idx, n)
+            
+            # Фильтруем экстремумы, которые находятся после exclude_end_idx
+            filtered_maxima = [int(idx) for idx in filtered_maxima if int(idx) < exclude_end_idx]
+            filtered_minima = [int(idx) for idx in filtered_minima if int(idx) < exclude_end_idx]
+        except Exception:
+            # В случае ошибки просто не исключаем экстремумы в конце
+            pass
     
     # 8. Заполняем датафрейм
     for idx in filtered_maxima:
@@ -1132,14 +1142,25 @@ def compute_smoothed_pressures_and_extremes(
                 date_series = historical_data_well.index
                 if len(date_series) > 0:
                     # Бинарный поиск ближайшей даты
-                    pos = date_series.searchsorted(date_dt)
-                    candidates = []
-                    
-                    # Проверяем позицию и соседние
-                    if pos < len(date_series):
-                        candidates.append((abs((date_series[pos] - date_dt).days), pos))
-                    if pos > 0:
-                        candidates.append((abs((date_series[pos-1] - date_dt).days), pos-1))
+                    try:
+                        # Убеждаемся, что date_dt это Timestamp
+                        if not isinstance(date_dt, pd.Timestamp):
+                            date_dt = pd.Timestamp(date_dt)
+                        
+                        pos = int(date_series.searchsorted(date_dt))
+                        candidates = []
+                        
+                        # Проверяем позицию и соседние
+                        if pos < len(date_series):
+                            date_at_pos = pd.Timestamp(date_series[pos])
+                            diff_days = abs((date_at_pos - date_dt).days)
+                            candidates.append((diff_days, int(pos)))
+                        if pos > 0:
+                            date_at_pos_minus = pd.Timestamp(date_series[pos-1])
+                            diff_days = abs((date_at_pos_minus - date_dt).days)
+                            candidates.append((diff_days, int(pos-1)))
+                    except Exception:
+                        candidates = []
                     
                     if candidates:
                         min_diff_days, min_idx = min(candidates, key=lambda x: x[0])
